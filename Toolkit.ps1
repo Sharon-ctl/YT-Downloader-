@@ -662,6 +662,8 @@ $Script:ErrorMessages = @{
     'removed by the uploader'      = @{ Message = 'This video has been deleted.';              Suggestion = 'The uploader has removed this content.' }
     'who has blocked it'           = @{ Message = 'This video is blocked in your country.';    Suggestion = 'The content owner has geo-restricted this video. Try a VPN or proxy.' }
     'Sign in to confirm your age'  = @{ Message = 'This video is age-restricted.';             Suggestion = 'Use Settings > Browser Cookies to enable cookie-based authentication.' }
+    'Sign in to confirm'             = @{ Message = 'YouTube is blocking this request (bot detection).'; Suggestion = 'Go to Settings > Browser Cookies and set your browser (e.g., chrome, edge, firefox).' }
+    'confirm you'                    = @{ Message = 'YouTube is blocking this request (bot detection).'; Suggestion = 'Go to Settings > Browser Cookies and set your browser (e.g., chrome, edge, firefox).' }
     'members-only'                 = @{ Message = 'This is members-only content.';             Suggestion = 'You need an active membership. Enable browser cookies in Settings.' }
     'Join this channel'            = @{ Message = 'This content requires a channel membership.'; Suggestion = 'Enable browser cookies in Settings if you are a member.' }
     'HTTP Error 403'               = @{ Message = 'Access forbidden (403).';                   Suggestion = 'The server denied access. Try browser cookies or a different URL.' }
@@ -1262,10 +1264,16 @@ function Get-MediaInfo {
 
     try {
         Write-Status "Fetching media information..." -Type Working
+        $oldEap = $ErrorActionPreference
+        $ErrorActionPreference = 'SilentlyContinue'
         $jsonOutput = & $Script:YtDlpPath @argsList 2>&1
+        $ErrorActionPreference = $oldEap
+
         $jsonStr = ($jsonOutput | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] }) | Out-String
         if ([string]::IsNullOrWhiteSpace($jsonStr)) {
-            $errorStr = ($jsonOutput | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] }) | Out-String
+            $errorRecords = $jsonOutput | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] }
+            $errorStr = ($errorRecords | ForEach-Object { $_.ToString() }) -join "`n"
+            if ([string]::IsNullOrWhiteSpace($errorStr)) { $errorStr = $errorRecords | Out-String }
             return @{ Error = $errorStr.Trim() }
         }
         $info = $jsonStr | ConvertFrom-Json
@@ -1516,6 +1524,9 @@ function Get-CommonArgs {
     [void]$argsList.Add('-o')
     [void]$argsList.Add($outputTemplate)
 
+    [void]$argsList.Add('--paths')
+    [void]$argsList.Add("temp:$env:TEMP\yt-dlp-toolkit")
+
     [void]$argsList.Add('--ffmpeg-location')
     [void]$argsList.Add($Script:FFmpegDir)
 
@@ -1638,6 +1649,9 @@ function Invoke-YtDlp {
     }
 
     $proc.WaitForExit()
+    if ($progressInitialized) {
+        Show-ProgressBar -Title $lastTitle -Complete
+    }
     $stdout = $stdoutTask.GetAwaiter().GetResult()
     $stderr = $errorOutput.ToString()
 
@@ -1733,31 +1747,16 @@ function Get-VideoFormatArgs {
         'h265'  { return @('-f', 'bv*[vcodec~=''^hev'']+ba/b', '--merge-output-format', 'mp4') }
         'av1'   { return @('-f', 'bv*[vcodec~=''^av01'']+ba/b', '--merge-output-format', 'mkv') }
         'vp9'   { return @('-f', 'bv*[vcodec~=''^vp0?9'']+ba/b', '--merge-output-format', 'mkv') }
-        '720p'  { return @('-f', 'bv*[height<=720]+ba/b[height<=720]', '--merge-output-format', 'mp4') }
-        '1080p' { return @('-f', 'bv*[height<=1080]+ba/b[height<=1080]', '--merge-output-format', 'mp4') }
-        '1440p' { return @('-f', 'bv*[height<=1440]+ba/b[height<=1440]', '--merge-output-format', 'mp4') }
-        '4k'    { return @('-f', 'bv*[height<=2160]+ba/b[height<=2160]', '--merge-output-format', 'mp4') }
+        '720p'  { return @('-f', 'bv*[height<=720]+ba/b', '--merge-output-format', 'mp4') }
+        '1080p' { return @('-f', 'bv*[height<=1080]+ba/b', '--merge-output-format', 'mp4') }
+        '1440p' { return @('-f', 'bv*[height<=1440]+ba/b', '--merge-output-format', 'mp4') }
+        '4k'    { return @('-f', 'bv*[height<=2160]+ba/b', '--merge-output-format', 'mp4') }
     }
 }
 
 function Start-VideoDownload {
-    param(
-        [ValidateSet('best','h264','h265','av1','vp9','720p','1080p','1440p','4k')]
-        [string]$FormatType = 'best'
-    )
     Clear-Screen
-    $descriptions = @{
-        'best'  = 'Best Quality Video'
-        'h264'  = 'H.264 Video (Premiere-friendly)'
-        'h265'  = 'H.265 / HEVC Video'
-        'av1'   = 'AV1 Video'
-        'vp9'   = 'VP9 Video'
-        '720p'  = '720p Video'
-        '1080p' = '1080p Video'
-        '1440p' = '1440p Video'
-        '4k'    = '4K Video'
-    }
-    Show-SectionHeader $descriptions[$FormatType]
+    Show-SectionHeader "Download Video"
 
     $url = Read-UserInput -Prompt "Enter video URL" -Required -IsUrl
     if ($null -eq $url) { Wait-User; return }
@@ -1766,9 +1765,41 @@ function Start-VideoDownload {
     if ($urlType -eq 'Playlist' -or $urlType -eq 'PlaylistVideo') {
         Write-Color "  This looks like a playlist URL." $Script:Colors.Info
         if (-not (Show-Confirmation "Download as single video (ignore playlist)?")) {
-            Start-PlaylistDownload -Url $url -FormatType $FormatType
+            Start-PlaylistDownload -Url $url
             return
         }
+    }
+
+    Write-Host ""
+    Write-Color "  Select Video Quality:" $Script:Colors.Heading
+    Show-MenuItem '1' "Best Quality (Default)"
+    Show-MenuItem '2' "H.264 (Premiere-friendly)"
+    Show-MenuItem '3' "H.265 / HEVC"
+    Show-MenuItem '4' "AV1"
+    Show-MenuItem '5' "720p"
+    Show-MenuItem '6' "1080p"
+    Show-MenuItem '7' "1440p"
+    Show-MenuItem '8' "4K"
+    Write-Host ""
+
+    $choice = Read-UserChoice -Prompt "Select quality" -Max 8
+    if ($null -eq $choice) { Wait-User; return }
+    
+    $formatMap = @{
+        '1'='best'; '2'='h264'; '3'='h265'; '4'='av1';
+        '5'='720p'; '6'='1080p'; '7'='1440p'; '8'='4k'
+    }
+    $FormatType = $formatMap[$choice]
+
+    $descriptions = @{
+        'best'  = 'Best Quality Video'
+        'h264'  = 'H.264 Video (Premiere-friendly)'
+        'h265'  = 'H.265 / HEVC Video'
+        'av1'   = 'AV1 Video'
+        '720p'  = '720p Video'
+        '1080p' = '1080p Video'
+        '1440p' = '1440p Video'
+        '4k'    = '4K Video'
     }
 
     $formatArgs = Get-VideoFormatArgs -FormatType $FormatType
@@ -1788,15 +1819,26 @@ function Start-VideoDownload {
 #region AudioDownloads
 
 function Start-AudioDownload {
-    param(
-        [ValidateSet('mp3','flac','wav','m4a','aac','opus','vorbis')]
-        [string]$Format = 'mp3'
-    )
     Clear-Screen
-    Show-SectionHeader "$($Format.ToUpper()) Audio Download"
+    Show-SectionHeader "Download Audio"
 
     $url = Read-UserInput -Prompt "Enter video/audio URL" -Required -IsUrl
     if ($null -eq $url) { Wait-User; return }
+
+    Write-Host ""
+    Write-Color "  Select Audio Format:" $Script:Colors.Heading
+    Show-MenuItem '1' "MP3 (Default)"
+    Show-MenuItem '2' "FLAC (Lossless)"
+    Show-MenuItem '3' "WAV (Lossless)"
+    Show-MenuItem '4' "M4A"
+    Show-MenuItem '5' "OPUS"
+    Write-Host ""
+
+    $choice = Read-UserChoice -Prompt "Select format" -Max 5
+    if ($null -eq $choice) { Wait-User; return }
+    
+    $formatMap = @{ '1'='mp3'; '2'='flac'; '3'='wav'; '4'='m4a'; '5'='opus' }
+    $Format = $formatMap[$choice]
 
     $quality = Get-Setting 'Audio' 'PreferredQuality'
     if ([string]::IsNullOrEmpty($quality)) { $quality = '320' }
@@ -1809,7 +1851,7 @@ function Start-AudioDownload {
     )
 
     Invoke-Download -Url $url -Type 'audio' -ExtraArgs $extraArgs `
-        -OutputDir $Script:DownloadDirs.Music -Description "$Format audio"
+        -OutputDir $Script:DownloadDirs.Music -Description "$([string]$Format.ToUpper()) audio"
 
     Wait-User
 }
@@ -2283,8 +2325,8 @@ function Start-BatchDownload {
 
     $extraArgs = switch ($fmtChoice) {
         '1' { @('-f', 'bv*+ba/b', '--merge-output-format', 'mkv') }
-        '2' { @('-f', 'bv*[height<=1080]+ba/b[height<=1080]', '--merge-output-format', 'mp4') }
-        '3' { @('-f', 'bv*[height<=720]+ba/b[height<=720]', '--merge-output-format', 'mp4') }
+        '2' { @('-f', 'bv*[height<=1080]+ba/b', '--merge-output-format', 'mp4') }
+        '3' { @('-f', 'bv*[height<=720]+ba/b', '--merge-output-format', 'mp4') }
         '4' { @('-x', '--audio-format', 'mp3', '--audio-quality', '320K') }
         '5' { @('-x', '--audio-format', 'flac') }
     }
@@ -3054,74 +3096,46 @@ function Show-MainMenu {
     Show-SectionHeader "Main Menu"
     Write-Host ""
 
-    Write-Color "  VIDEO" $Script:Colors.Heading
-    Show-MenuItem '1'  "Best Quality Video"
-    Show-MenuItem '2'  "H.264 Video (Premiere-friendly)"
-    Show-MenuItem '3'  "H.265 / HEVC Video"
-    Show-MenuItem '4'  "AV1 Video"
-    Show-MenuItem '5'  "720p Video"
-    Show-MenuItem '6'  "1080p Video"
-    Show-MenuItem '7'  "1440p Video"
-    Show-MenuItem '8'  "4K Video"
-    Write-Host ""
-
-    Write-Color "  AUDIO" $Script:Colors.Heading
-    Show-MenuItem '9'  "MP3"
-    Show-MenuItem '10' "FLAC"
-    Show-MenuItem '11' "WAV"
-    Show-MenuItem '12' "M4A"
-    Show-MenuItem '13' "OPUS"
+    Write-Color "  DOWNLOAD" $Script:Colors.Heading
+    Show-MenuItem '1'  "Download Video"
+    Show-MenuItem '2'  "Download Audio"
     Write-Host ""
 
     Write-Color "  ADVANCED" $Script:Colors.Heading
-    Show-MenuItem '14' "Playlist Download"
-    Show-MenuItem '15' "Livestream Download"
-    Show-MenuItem '16' "Download Thumbnail"
-    Show-MenuItem '17' "Download Subtitles"
-    Show-MenuItem '18' "Download Metadata"
-    Show-MenuItem '19' "SponsorBlock Download"
-    Show-MenuItem '20' "Batch Downloads"
+    Show-MenuItem '3'  "Playlist Download"
+    Show-MenuItem '4'  "Livestream Download"
+    Show-MenuItem '5'  "Batch Downloads"
+    Show-MenuItem '6'  "Download Thumbnail"
+    Show-MenuItem '7'  "Download Subtitles"
+    Show-MenuItem '8'  "Download Metadata"
+    Show-MenuItem '9'  "SponsorBlock Download"
     Write-Host ""
 
     Write-Color "  TOOLS" $Script:Colors.Heading
-    Show-MenuItem '21' "Convert Existing Files"
-    Show-MenuItem '22' "Settings"
-    Show-MenuItem '23' "Maintenance"
-    Show-MenuItem '24' "History"
-    Show-MenuItem '25' "Open Download Folder"
-    Show-MenuItem '26' "About"
-    Show-MenuItem '27' "Exit"
+    Show-MenuItem '10' "Convert Existing Files"
+    Show-MenuItem '11' "Open Download Folder"
+    Show-MenuItem '12' "History"
+    Show-MenuItem '13' "Settings"
+    Show-MenuItem '14' "Maintenance"
+    Show-MenuItem '15' "About"
+    Show-MenuItem '16' "Exit"
 }
 
 function Invoke-MainMenuAction {
     param([string]$Choice)
 
     switch ($Choice) {
-        '1'  { Start-VideoDownload -FormatType 'best' }
-        '2'  { Start-VideoDownload -FormatType 'h264' }
-        '3'  { Start-VideoDownload -FormatType 'h265' }
-        '4'  { Start-VideoDownload -FormatType 'av1' }
-        '5'  { Start-VideoDownload -FormatType '720p' }
-        '6'  { Start-VideoDownload -FormatType '1080p' }
-        '7'  { Start-VideoDownload -FormatType '1440p' }
-        '8'  { Start-VideoDownload -FormatType '4k' }
-        '9'  { Start-AudioDownload -Format 'mp3' }
-        '10' { Start-AudioDownload -Format 'flac' }
-        '11' { Start-AudioDownload -Format 'wav' }
-        '12' { Start-AudioDownload -Format 'm4a' }
-        '13' { Start-AudioDownload -Format 'opus' }
-        '14' { Start-PlaylistDownload }
-        '15' { Start-LivestreamDownload }
-        '16' { Start-ThumbnailDownload }
-        '17' { Start-SubtitleDownload }
-        '18' { Start-MetadataDownload }
-        '19' { Start-SponsorBlockDownload }
-        '20' { Start-BatchDownload }
-        '21' { Start-FileConversion }
-        '22' { Show-SettingsMenu }
-        '23' { Show-MaintenanceMenu }
-        '24' { Show-History }
-        '25' {
+        '1'  { Start-VideoDownload }
+        '2'  { Start-AudioDownload }
+        '3'  { Start-PlaylistDownload }
+        '4'  { Start-LivestreamDownload }
+        '5'  { Start-BatchDownload }
+        '6'  { Start-ThumbnailDownload }
+        '7'  { Start-SubtitleDownload }
+        '8'  { Start-MetadataDownload }
+        '9'  { Start-SponsorBlockDownload }
+        '10' { Start-FileConversion }
+        '11' {
             $downloadFolder = Get-Setting 'General' 'DownloadFolder'
             if (-not [System.IO.Path]::IsPathRooted($downloadFolder)) {
                 $downloadFolder = Join-Path $Script:ToolkitRoot $downloadFolder
@@ -3133,8 +3147,11 @@ function Invoke-MainMenuAction {
                 Wait-User
             }
         }
-        '26' { Show-About }
-        '27' { return 'exit' }
+        '12' { Show-History }
+        '13' { Show-SettingsMenu }
+        '14' { Show-MaintenanceMenu }
+        '15' { Show-About }
+        '16' { return 'exit' }
         default {
             Write-Color "  Invalid option. Please try again." $Script:Colors.Warning
             Start-Sleep -Milliseconds 800
@@ -3159,7 +3176,7 @@ try {
         Clear-Screen
         Show-MainMenu
 
-        $choice = Read-UserChoice -Prompt "Select option" -Max 27
+        $choice = Read-UserChoice -Prompt "Select option" -Max 16
         if ($null -eq $choice) { continue }
 
         $result = Invoke-MainMenuAction -Choice $choice
