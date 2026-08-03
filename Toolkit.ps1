@@ -419,6 +419,9 @@ function Wait-User {
     param([string]$Message = 'Press any key to continue...')
     Write-Host ""
     Write-Color "  $Message" $Script:Colors.Muted
+    while ($Host.UI.RawUI.KeyAvailable) {
+        $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
+    }
     $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
     Write-Host ""
 }
@@ -675,6 +678,7 @@ $Script:ErrorMessages = @{
     'Premieres in'                 = @{ Message = 'This video has not premiered yet.';         Suggestion = 'The video will be available after the scheduled premiere time.' }
     'ffmpeg'                       = @{ Message = 'FFmpeg encountered an error.';              Suggestion = 'Try reinstalling FFmpeg from the Maintenance menu.' }
     'Merge'                        = @{ Message = 'Failed to merge video and audio streams.';  Suggestion = 'Try reinstalling FFmpeg or choose a different format.' }
+    'WinError 32'                  = @{ Message = 'File lock error (WinError 32).';            Suggestion = 'A cloud sync engine (like OneDrive) locked the file. Try downloading to a non-synced folder.' }
     'already been downloaded'      = @{ Message = 'This video was already downloaded.';        Suggestion = 'Check your archive. Disable Archive Mode in Settings to re-download.' }
     'disk'                         = @{ Message = 'Disk operation failed.';                    Suggestion = 'Check available disk space and write permissions.' }
     'No space left'                = @{ Message = 'Your disk is full.';                        Suggestion = 'Free up disk space and try again.' }
@@ -1505,12 +1509,11 @@ function Format-Speed {
 #region CoreDownloader
 
 function Get-OutputTemplate {
-    param([string]$OutputDir)
     $template = Get-Setting 'Downloads' 'FilenameTemplate'
     if ([string]::IsNullOrEmpty($template)) {
         $template = '%(title)s.%(ext)s'
     }
-    return Join-Path $OutputDir $template
+    return $template
 }
 
 function Get-CommonArgs {
@@ -1520,12 +1523,19 @@ function Get-CommonArgs {
     )
     $argsList = [System.Collections.ArrayList]@()
 
-    $outputTemplate = Get-OutputTemplate $OutputDir
+    $outputTemplate = Get-OutputTemplate
     [void]$argsList.Add('-o')
     [void]$argsList.Add($outputTemplate)
 
+    if ($OutputDir -and $OutputDir -ne '') {
+        [void]$argsList.Add('--paths')
+        [void]$argsList.Add("home:$OutputDir")
+    }
+
+    $tempDir = Join-Path $env:TEMP 'yt-dlp-toolkit'
+    if (-not (Test-Path $tempDir)) { New-Item -ItemType Directory -Path $tempDir -Force | Out-Null }
     [void]$argsList.Add('--paths')
-    [void]$argsList.Add("temp:$env:TEMP\yt-dlp-toolkit")
+    [void]$argsList.Add("temp:$tempDir")
 
     [void]$argsList.Add('--ffmpeg-location')
     [void]$argsList.Add($Script:FFmpegDir)
@@ -1602,18 +1612,18 @@ function Invoke-YtDlp {
         return @{ Success = $false; ExitCode = -1; Error = $_.Exception.Message; Output = '' }
     }
 
-    $stdoutTask = $proc.StandardOutput.ReadToEndAsync()
+    $stderrTask = $proc.StandardError.ReadToEndAsync()
 
-    $errorOutput = [System.Text.StringBuilder]::new()
+    $stdOutput = [System.Text.StringBuilder]::new()
     $progressInitialized = $false
     $lastTitle = $Title
 
-    while (-not $proc.StandardError.EndOfStream) {
-        $line = $proc.StandardError.ReadLine()
+    while (-not $proc.StandardOutput.EndOfStream) {
+        $line = $proc.StandardOutput.ReadLine()
         if ($null -eq $line) { continue }
 
         Write-Log 'DEBUG' $line
-        [void]$errorOutput.AppendLine($line)
+        [void]$stdOutput.AppendLine($line)
 
         if ($line -match '\[download\]\s+([\d.]+)%\s+of\s+~?([\d.]+\S+)\s+at\s+([\d.]+\S+)\s+ETA\s+(\S+)') {
             $percent    = [double]$Matches[1]
@@ -1643,17 +1653,14 @@ function Invoke-YtDlp {
         elseif ($line -match '\[ExtractAudio\]') {
             Write-Color "`r  Extracting audio...".PadRight(70) $Script:Colors.Info
         }
-        elseif ($line -match 'ERROR:') {
-            Write-Log 'ERROR' $line
-        }
     }
 
     $proc.WaitForExit()
     if ($progressInitialized) {
         Show-ProgressBar -Title $lastTitle -Complete
     }
-    $stdout = $stdoutTask.GetAwaiter().GetResult()
-    $stderr = $errorOutput.ToString()
+    $stderr = $stderrTask.GetAwaiter().GetResult()
+    $stdout = $stdOutput.ToString()
 
     $success = $proc.ExitCode -eq 0
     if ($success) {
@@ -1805,7 +1812,7 @@ function Start-VideoDownload {
     $formatArgs = Get-VideoFormatArgs -FormatType $FormatType
     $extraArgs = @('--no-playlist') + $formatArgs
 
-    Invoke-Download -Url $url -Type 'video' -ExtraArgs $extraArgs `
+    $null = Invoke-Download -Url $url -Type 'video' -ExtraArgs $extraArgs `
         -OutputDir $Script:DownloadDirs.Videos -Description $descriptions[$FormatType]
 
     Wait-User
@@ -1850,7 +1857,7 @@ function Start-AudioDownload {
         '--audio-quality', "${quality}K"
     )
 
-    Invoke-Download -Url $url -Type 'audio' -ExtraArgs $extraArgs `
+    $null = Invoke-Download -Url $url -Type 'audio' -ExtraArgs $extraArgs `
         -OutputDir $Script:DownloadDirs.Music -Description "$([string]$Format.ToUpper()) audio"
 
     Wait-User
@@ -2268,7 +2275,7 @@ function Start-SponsorBlockDownload {
         '--sponsorblock-remove', $categories
     )
 
-    Invoke-Download -Url $url -Type 'video (SponsorBlock)' -ExtraArgs $extraArgs `
+    $null = Invoke-Download -Url $url -Type 'video (SponsorBlock)' -ExtraArgs $extraArgs `
         -OutputDir $Script:DownloadDirs.Videos -Description 'SponsorBlock download'
 
     Wait-User
