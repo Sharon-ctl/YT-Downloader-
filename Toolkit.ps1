@@ -41,15 +41,15 @@ $Script:Config           = @{}
 $Script:CurrentTheme     = 'Classic'
 $Script:SessionStartTime = Get-Date
 
-# Download subdirectories
+# Download directory (all media files saved directly into downloads folder)
 $Script:DownloadDirs = @{
-    Videos      = Join-Path $Script:DownloadBaseDir 'Videos'
-    Music       = Join-Path $Script:DownloadBaseDir 'Music'
-    Playlists   = Join-Path $Script:DownloadBaseDir 'Playlists'
-    Livestreams = Join-Path $Script:DownloadBaseDir 'Livestreams'
-    Shorts      = Join-Path $Script:DownloadBaseDir 'Shorts'
-    Subtitles   = Join-Path $Script:DownloadBaseDir 'Subtitles'
-    Metadata    = Join-Path $Script:DownloadBaseDir 'Metadata'
+    Videos      = $Script:DownloadBaseDir
+    Music       = $Script:DownloadBaseDir
+    Playlists   = $Script:DownloadBaseDir
+    Livestreams = $Script:DownloadBaseDir
+    Shorts      = $Script:DownloadBaseDir
+    Subtitles   = $Script:DownloadBaseDir
+    Metadata    = $Script:DownloadBaseDir
 }
 
 # yt-dlp download URL
@@ -74,7 +74,7 @@ $Script:SponsorBlockCategories = [ordered]@{
 $Script:AudioFormats = @('mp3', 'flac', 'wav', 'm4a', 'aac', 'opus', 'vorbis')
 
 # Supported video codecs
-$Script:VideoCodecs = @('best', 'h264', 'h265', 'av1', 'vp9')
+$Script:VideoCodecs = @('best', 'premiere-prores', 'premiere-lossless', 'h264', 'h265', 'av1', 'vp9')
 
 # Console encoding
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
@@ -301,12 +301,42 @@ function Read-UserInput {
         [switch]$IsUrl,
         [switch]$AllowEmpty
     )
+    $clip = $null
+    if ($IsUrl) {
+        try {
+            $clipText = Get-Clipboard -ErrorAction SilentlyContinue
+            if ($clipText -is [string] -and (Test-UrlValid $clipText.Trim())) {
+                $clip = $clipText.Trim()
+            }
+        } catch { }
+    }
+
     Write-Host ""
-    Write-Color "  $Prompt" $Script:Colors.Accent -NoNewline
+    if ($clip) {
+        $displayClip = if ($clip.Length -gt 55) { $clip.Substring(0, 52) + '...' } else { $clip }
+        Write-Color "  [Clipboard URL detected: $displayClip]" $Script:Colors.Info
+        Write-Color "  $Prompt (Press Enter to use clipboard)" $Script:Colors.Accent -NoNewline
+    } else {
+        Write-Color "  $Prompt" $Script:Colors.Accent -NoNewline
+    }
     Write-Color ": " $Script:Colors.Muted -NoNewline
     $val = Read-Host
     if ($null -eq $val) { $val = '' }
     $val = $val.Trim()
+
+    # Strip quotes if copied with "Copy as Path" or dragged into console
+    if ($val -match '^["''](.*)["'']$') {
+        $val = $Matches[1].Trim()
+    }
+    if ($val -match '^&\s*["''](.*)["'']$') {
+        $val = $Matches[1].Trim()
+    }
+
+    if ([string]::IsNullOrEmpty($val) -and $clip) {
+        $val = $clip
+        Write-Color "  Using: $val" $Script:Colors.Value
+    }
+
     if ($Required -and [string]::IsNullOrEmpty($val)) {
         Write-Color "  This field is required." $Script:Colors.Warning
         return $null
@@ -520,16 +550,20 @@ function Export-Diagnostics {
 
 $Script:DefaultConfig = [ordered]@{
     General = [ordered]@{
-        DownloadFolder        = 'downloads'
-        Theme                 = 'Classic'
-        AutoUpdate            = 'true'
-        AutoOpenFolder        = 'false'
-        RetryCount            = '3'
+        DownloadFolder         = 'downloads'
+        Theme                  = 'Classic'
+        AutoUpdate             = 'true'
+        AutoOpenFolder         = 'false'
+        RetryCount             = '3'
         DiskWarningThresholdGB = '2'
+        ConcurrentFragments    = '4'
+        SpeedLimit             = '0'
     }
     Video = [ordered]@{
         PreferredCodec      = 'best'
         PreferredResolution = 'best'
+        EmbedSubtitles      = 'false'
+        EmbedChapters       = 'true'
     }
     Audio = [ordered]@{
         PreferredFormat  = 'mp3'
@@ -847,7 +881,7 @@ function Initialize-Folders {
         $Script:LogDir
         $Script:CacheDir
         $Script:TempDir
-    ) + @($Script:DownloadDirs.Values)
+    ) | Select-Object -Unique
 
     $created = 0
     foreach ($folder in $folders) {
@@ -926,6 +960,24 @@ function Invoke-StartupSequence {
             Write-Status "Configuration repaired" -Type Warning
         } else {
             Write-Status "Configuration loaded" -Type Success
+        }
+    }
+
+    $customDl = Get-Setting 'General' 'DownloadFolder'
+    if ($customDl) {
+        if (-not [System.IO.Path]::IsPathRooted($customDl)) {
+            $Script:DownloadBaseDir = Join-Path $Script:ToolkitRoot $customDl
+        } else {
+            $Script:DownloadBaseDir = $customDl
+        }
+        $Script:DownloadDirs = @{
+            Videos      = $Script:DownloadBaseDir
+            Music       = $Script:DownloadBaseDir
+            Playlists   = $Script:DownloadBaseDir
+            Livestreams = $Script:DownloadBaseDir
+            Shorts      = $Script:DownloadBaseDir
+            Subtitles   = $Script:DownloadBaseDir
+            Metadata    = $Script:DownloadBaseDir
         }
     }
 
@@ -1558,6 +1610,35 @@ function Get-CommonArgs {
         [void]$argsList.Add('--embed-thumbnail')
     }
 
+    if ((Get-Setting 'Video' 'EmbedChapters') -eq 'true') {
+        [void]$argsList.Add('--embed-chapters')
+    }
+
+    if ((Get-Setting 'Video' 'EmbedSubtitles') -eq 'true') {
+        [void]$argsList.Add('--embed-subs')
+        [void]$argsList.Add('--sub-langs')
+        [void]$argsList.Add('all,-live_chat')
+    }
+
+    $concFrag = Get-Setting 'General' 'ConcurrentFragments'
+    if ($concFrag -and [int]$concFrag -gt 1) {
+        [void]$argsList.Add('-N')
+        [void]$argsList.Add([string]$concFrag)
+    }
+
+    $speedLimit = Get-Setting 'General' 'SpeedLimit'
+    if ($speedLimit -and $speedLimit -ne '0' -and $speedLimit -ne '') {
+        [void]$argsList.Add('--limit-rate')
+        [void]$argsList.Add($speedLimit)
+    }
+
+    if ((Get-Setting 'SponsorBlock' 'Enabled') -eq 'true') {
+        $sbCats = Get-Setting 'SponsorBlock' 'Categories'
+        if (-not $sbCats) { $sbCats = 'sponsor' }
+        [void]$argsList.Add('--sponsorblock-remove')
+        [void]$argsList.Add($sbCats)
+    }
+
     $cookieBrowser = Get-Setting 'Network' 'CookieBrowser'
     if ($cookieBrowser -and $cookieBrowser -ne 'none') {
         [void]$argsList.Add('--cookies-from-browser')
@@ -1612,54 +1693,159 @@ function Invoke-YtDlp {
         return @{ Success = $false; ExitCode = -1; Error = $_.Exception.Message; Output = '' }
     }
 
-    $stderrTask = $proc.StandardError.ReadToEndAsync()
-
+    # Read both stdout and stderr concurrently to prevent deadlocks and show live status
     $stdOutput = [System.Text.StringBuilder]::new()
+    $stdError  = [System.Text.StringBuilder]::new()
     $progressInitialized = $false
     $lastTitle = $Title
+    $postProcessing = $false
+    $postProcessPhase = ''
+    $postProcessStart = $null
+    $spinnerFrames = @('|', '/', '-', '\')
+    $spinnerIdx = 0
 
-    while (-not $proc.StandardOutput.EndOfStream) {
-        $line = $proc.StandardOutput.ReadLine()
-        if ($null -eq $line) { continue }
+    # Use async reads for both streams
+    $stdoutTask = $proc.StandardOutput.ReadLineAsync()
+    $stderrTask = $proc.StandardError.ReadLineAsync()
 
-        Write-Log 'DEBUG' $line
-        [void]$stdOutput.AppendLine($line)
+    while (-not $proc.HasExited -or ($null -ne $stdoutTask) -or ($null -ne $stderrTask)) {
+        $didWork = $false
 
-        if ($line -match '\[download\]\s+([\d.]+)%\s+of\s+~?([\d.]+\S+)\s+at\s+([\d.]+\S+)\s+ETA\s+(\S+)') {
-            $percent    = [double]$Matches[1]
-            $totalSize  = $Matches[2]
-            $speed      = $Matches[3]
-            $eta        = $Matches[4]
+        # Check stdout
+        if ($null -ne $stdoutTask -and $stdoutTask.IsCompleted) {
+            $line = $stdoutTask.GetAwaiter().GetResult()
+            if ($null -ne $line) {
+                Write-Log 'DEBUG' $line
+                [void]$stdOutput.AppendLine($line)
 
-            if (-not $progressInitialized) {
-                Write-Host ""; Write-Host ""; Write-Host ""; Write-Host ""
-                $progressInitialized = $true
+                if ($line -match '\[download\]\s+([\d.]+)%\s+of\s+~?([\d.]+\S+)\s+at\s+([\d.]+\S+)\s+ETA\s+(\S+)') {
+                    $percent    = [double]$Matches[1]
+                    $totalSize  = $Matches[2]
+                    $speed      = $Matches[3]
+                    $eta        = $Matches[4]
+
+                    if (-not $progressInitialized) {
+                        Write-Host ""; Write-Host ""; Write-Host ""; Write-Host ""
+                        $progressInitialized = $true
+                    }
+                    $postProcessing = $false
+                    Show-ProgressBar -Title $lastTitle -Percent $percent -Total $totalSize -Speed $speed -ETA $eta
+                }
+                elseif ($line -match '\[download\]\s+100%\s+of') {
+                    if ($progressInitialized) {
+                        Show-ProgressBar -Title $lastTitle -Percent 100 -Total '' -Speed '' -ETA '00:00'
+                    }
+                }
+                elseif ($line -match '\[download\]\s+Destination:\s+(.+)') {
+                    $lastTitle = [System.IO.Path]::GetFileNameWithoutExtension($Matches[1])
+                    Write-Log 'INFO' "Destination: $($Matches[1])"
+                }
+                elseif ($line -match '\[Merger\]') {
+                    $postProcessing = $true
+                    $postProcessPhase = 'Merging audio and video'
+                    $postProcessStart = Get-Date
+                    Write-Color "`r  $postProcessPhase...".PadRight(80) $Script:Colors.Info
+                }
+                elseif ($line -match '\[ExtractAudio\]') {
+                    $postProcessing = $true
+                    $postProcessPhase = 'Extracting audio'
+                    $postProcessStart = Get-Date
+                    Write-Color "`r  $postProcessPhase...".PadRight(80) $Script:Colors.Info
+                }
+                elseif ($line -match '\[VideoConvertor\]') {
+                    $postProcessing = $true
+                    $postProcessPhase = 'Converting video (this may take a while)'
+                    $postProcessStart = Get-Date
+                    Write-Color "`r  $postProcessPhase...".PadRight(80) $Script:Colors.Info
+                }
+                elseif ($line -match '\[VideoRemuxer\]') {
+                    $postProcessing = $true
+                    $postProcessPhase = 'Remuxing video'
+                    $postProcessStart = Get-Date
+                    Write-Color "`r  $postProcessPhase...".PadRight(80) $Script:Colors.Info
+                }
+                elseif ($line -match '\[EmbedThumbnail\]') {
+                    $postProcessing = $true
+                    $postProcessPhase = 'Embedding thumbnail'
+                    $postProcessStart = Get-Date
+                }
+                elseif ($line -match '\[Metadata\]') {
+                    $postProcessing = $true
+                    $postProcessPhase = 'Embedding metadata'
+                    $postProcessStart = Get-Date
+                }
+
+                $stdoutTask = $proc.StandardOutput.ReadLineAsync()
+                $didWork = $true
+            } else {
+                # stdout closed
+                $stdoutTask = $null
             }
-
-            Show-ProgressBar -Title $lastTitle -Percent $percent -Total $totalSize -Speed $speed -ETA $eta
         }
-        elseif ($line -match '\[download\]\s+100%\s+of') {
-            if ($progressInitialized) {
-                Show-ProgressBar -Title $lastTitle -Percent 100 -Total '' -Speed '' -ETA '00:00'
+
+        # Check stderr
+        if ($null -ne $stderrTask -and $stderrTask.IsCompleted) {
+            $errLine = $stderrTask.GetAwaiter().GetResult()
+            if ($null -ne $errLine) {
+                Write-Log 'DEBUG' "[stderr] $errLine"
+                [void]$stdError.AppendLine($errLine)
+
+                # Show conversion progress from FFmpeg stderr (e.g. "frame=  120 fps= 24 ...")
+                if ($postProcessing -and $errLine -match 'frame=\s*(\d+)\s+fps=\s*([\d.]+)\s+.*time=(\S+)') {
+                    $frame = $Matches[1]
+                    $fps   = $Matches[2]
+                    $time  = $Matches[3]
+                    $elapsed = ''
+                    if ($postProcessStart) {
+                        $elapsedSec = [int]((Get-Date) - $postProcessStart).TotalSeconds
+                        $elapsed = " | Elapsed: $([TimeSpan]::FromSeconds($elapsedSec).ToString('mm\:ss'))"
+                    }
+                    Write-Host "`r  $postProcessPhase... frame $frame | fps $fps | time $time$elapsed    " -ForegroundColor $Script:Colors.Info -NoNewline
+                }
+                # Detect errors in stderr early
+                elseif ($errLine -match '^ERROR:') {
+                    Write-Log 'ERROR' "[stderr] $errLine"
+                }
+
+                $stderrTask = $proc.StandardError.ReadLineAsync()
+                $didWork = $true
+            } else {
+                # stderr closed
+                $stderrTask = $null
             }
         }
-        elseif ($line -match '\[download\]\s+Destination:\s+(.+)') {
-            $lastTitle = [System.IO.Path]::GetFileNameWithoutExtension($Matches[1])
-            Write-Log 'INFO' "Destination: $($Matches[1])"
+
+        # If post-processing and no output for a bit, show a spinner with elapsed time
+        if (-not $didWork) {
+            if ($postProcessing -and $postProcessStart) {
+                $elapsedSec = [int]((Get-Date) - $postProcessStart).TotalSeconds
+                $elapsed = [TimeSpan]::FromSeconds($elapsedSec).ToString('mm\:ss')
+                $spinner = $spinnerFrames[$spinnerIdx % $spinnerFrames.Count]
+                $spinnerIdx++
+                Write-Host "`r  $spinner $postProcessPhase... Elapsed: $elapsed    " -ForegroundColor $Script:Colors.Info -NoNewline
+            }
+            Start-Sleep -Milliseconds 250
         }
-        elseif ($line -match '\[Merger\]') {
-            Write-Color "`r  Merging audio and video...".PadRight(70) $Script:Colors.Info
-        }
-        elseif ($line -match '\[ExtractAudio\]') {
-            Write-Color "`r  Extracting audio...".PadRight(70) $Script:Colors.Info
-        }
+
+        # Both streams closed, break
+        if ($null -eq $stdoutTask -and $null -eq $stderrTask) { break }
     }
 
-    $proc.WaitForExit()
+    # Wait for process to fully exit
+    if (-not $proc.HasExited) {
+        $proc.WaitForExit()
+    }
+
     if ($progressInitialized) {
         Show-ProgressBar -Title $lastTitle -Complete
     }
-    $stderr = $stderrTask.GetAwaiter().GetResult()
+    if ($postProcessing) {
+        # Clear the spinner line
+        Write-Host "`r".PadRight(90) -NoNewline
+        Write-Host ""
+    }
+
+    $stderr = $stdError.ToString()
     $stdout = $stdOutput.ToString()
 
     $success = $proc.ExitCode -eq 0
@@ -1667,6 +1853,10 @@ function Invoke-YtDlp {
         Write-Log 'INFO' "Download completed successfully: $Title"
     } else {
         Write-Log 'ERROR' "Download failed (exit code $($proc.ExitCode)): $Title"
+        # Log the stderr for debugging
+        if ($stderr) {
+            Write-Log 'ERROR' "stderr: $stderr"
+        }
     }
 
     return @{
@@ -1712,6 +1902,38 @@ function Invoke-Download {
     $result = Invoke-YtDlp -Arguments $commonArgs.ToArray() -Title $title -Url $Url
 
     if ($result.Success) {
+        # Detect if yt-dlp skipped the download because it was already in the archive
+        if ($result.Output -match 'already been recorded in the archive|has already been downloaded and merged') {
+            Write-Host ""
+            Write-Status "This video is in your download archive and was skipped." -Type Warning
+            Write-Color "  If the file was deleted, you can re-download it." $Script:Colors.Info
+
+            if (Show-Confirmation "Remove from archive and download again?") {
+                # Re-download without the archive check
+                $retryArgs = Get-CommonArgs -OutputDir $OutputDir -NoArchive
+                $retryArgs.AddRange($ExtraArgs)
+                $retryResult = Invoke-YtDlp -Arguments $retryArgs.ToArray() -Title $title -Url $Url
+
+                if ($retryResult.Success) {
+                    Write-Host ""
+                    Write-Status "Download complete: $title" -Type Success
+                    Add-HistoryEntry -Url $Url -Title $title -Website $info.Website -OutputDir $OutputDir `
+                        -Duration $info.Duration -Status 'Success'
+                    if ((Get-Setting 'General' 'AutoOpenFolder') -eq 'true') {
+                        Start-Process 'explorer.exe' -ArgumentList $OutputDir
+                    }
+                    return $true
+                } else {
+                    Write-Host ""
+                    Show-Error -RawError $retryResult.Error
+                    Add-HistoryEntry -Url $Url -Title $title -Website $info.Website -OutputDir $OutputDir `
+                        -Duration $info.Duration -Status 'Failed'
+                    return $false
+                }
+            }
+            return $true
+        }
+
         Write-Host ""
         Write-Status "Download complete: $title" -Type Success
 
@@ -1745,19 +1967,51 @@ function Invoke-Download {
 
 function Get-VideoFormatArgs {
     param(
-        [ValidateSet('best','h264','h265','av1','vp9','720p','1080p','1440p','4k')]
+        [ValidateSet('best','h264','h265','av1','vp9','720p','1080p','1440p','4k','premiere-prores','premiere-lossless')]
         [string]$FormatType
     )
     switch ($FormatType) {
-        'best'  { return @('-f', 'bv*+ba/b', '--merge-output-format', 'mkv') }
-        'h264'  { return @('-f', 'bv*[vcodec~=''^avc'']+ba/b', '--merge-output-format', 'mp4') }
-        'h265'  { return @('-f', 'bv*[vcodec~=''^hev'']+ba/b', '--merge-output-format', 'mp4') }
-        'av1'   { return @('-f', 'bv*[vcodec~=''^av01'']+ba/b', '--merge-output-format', 'mkv') }
-        'vp9'   { return @('-f', 'bv*[vcodec~=''^vp0?9'']+ba/b', '--merge-output-format', 'mkv') }
-        '720p'  { return @('-f', 'bv*[height<=720]+ba/b', '--merge-output-format', 'mp4') }
-        '1080p' { return @('-f', 'bv*[height<=1080]+ba/b', '--merge-output-format', 'mp4') }
-        '1440p' { return @('-f', 'bv*[height<=1440]+ba/b', '--merge-output-format', 'mp4') }
-        '4k'    { return @('-f', 'bv*[height<=2160]+ba/b', '--merge-output-format', 'mp4') }
+        'best'              { return @('-f', 'bv*+ba/b', '--merge-output-format', 'mkv') }
+        'h264'              { return @('-f', 'bv*[vcodec~=''^avc'']+ba/b', '--merge-output-format', 'mp4') }
+        'h265'              { return @('-f', 'bv*[vcodec~=''^hev'']+ba/b', '--merge-output-format', 'mp4') }
+        'av1'               { return @('-f', 'bv*[vcodec~=''^av01'']+ba/b', '--merge-output-format', 'mkv') }
+        'vp9'               { return @('-f', 'bv*[vcodec~=''^vp0?9'']+ba/b', '--merge-output-format', 'mkv') }
+        '720p'              { return @('-f', 'bv*[height<=720]+ba/b', '--merge-output-format', 'mp4') }
+        '1080p'             { return @('-f', 'bv*[height<=1080]+ba/b', '--merge-output-format', 'mp4') }
+        '1440p'             { return @('-f', 'bv*[height<=1440]+ba/b', '--merge-output-format', 'mp4') }
+        '4k'                { return @('-f', 'bv*[height<=2160]+ba/b', '--merge-output-format', 'mp4') }
+        'premiere-prores'   { return @('-f', 'bv*+ba/b', '--no-embed-thumbnail', '--recode-video', 'mov', '--postprocessor-args', 'VideoConvertor:-map -0:t -c:v prores_ks -profile:v 3 -c:a pcm_s16le -ar 48000') }
+        'premiere-lossless' { return @('-f', 'bv*+ba/b', '--no-embed-thumbnail', '--recode-video', 'mp4', '--postprocessor-args', 'VideoConvertor:-map -0:t -c:v libx264 -crf 0 -preset veryfast -pix_fmt yuv420p -c:a aac -b:a 320k -ar 48000') }
+    }
+}
+
+function Get-PreferredVideoFormatArgs {
+    $codec = Get-Setting 'Video' 'PreferredCodec'
+    $res   = Get-Setting 'Video' 'PreferredResolution'
+    if (-not $codec) { $codec = 'best' }
+    if (-not $res)   { $res   = 'best' }
+
+    if ($codec -eq 'premiere-prores' -or $codec -eq 'premiere-lossless') {
+        return Get-VideoFormatArgs -FormatType $codec
+    }
+
+    if ($res -ne 'best' -and $codec -ne 'best') {
+        $maxH = $res -replace '\D'
+        $codecFilter = switch ($codec) {
+            'h264' { "vcodec~='^avc'" }
+            'h265' { "vcodec~='^hev'" }
+            'av1'  { "vcodec~='^av01'" }
+            'vp9'  { "vcodec~='^vp0?9'" }
+            default { "" }
+        }
+        $fmtStr = if ($codecFilter) { "bv*[height<=$maxH][$codecFilter]+ba/b" } else { "bv*[height<=$maxH]+ba/b" }
+        return @('-f', $fmtStr, '--merge-output-format', 'mp4')
+    } elseif ($res -ne 'best') {
+        return Get-VideoFormatArgs -FormatType $res
+    } elseif ($codec -ne 'best') {
+        return Get-VideoFormatArgs -FormatType $codec
+    } else {
+        return Get-VideoFormatArgs -FormatType 'best'
     }
 }
 
@@ -1777,39 +2031,55 @@ function Start-VideoDownload {
         }
     }
 
+    $prefRes = Get-Setting 'Video' 'PreferredResolution'
+    if (-not $prefRes) { $prefRes = 'best' }
+    $prefCodec = Get-Setting 'Video' 'PreferredCodec'
+    if (-not $prefCodec) { $prefCodec = 'best' }
+
     Write-Host ""
     Write-Color "  Select Video Quality:" $Script:Colors.Heading
-    Show-MenuItem '1' "Best Quality (Default)"
-    Show-MenuItem '2' "H.264 (Premiere-friendly)"
-    Show-MenuItem '3' "H.265 / HEVC"
-    Show-MenuItem '4' "AV1"
-    Show-MenuItem '5' "720p"
-    Show-MenuItem '6' "1080p"
-    Show-MenuItem '7' "1440p"
-    Show-MenuItem '8' "4K"
+    Show-MenuItem '1'  "Preferred Settings ($prefRes, $prefCodec)"
+    Show-MenuItem '2'  "Best Quality Available (MKV)"
+    Show-MenuItem '3'  "1080p (Full HD - MP4)"
+    Show-MenuItem '4'  "720p (HD - MP4)"
+    Show-MenuItem '5'  "4K (Ultra HD)"
+    Show-MenuItem '6'  "1440p (2K QHD)"
+    Show-MenuItem '7'  "Premiere Pro: Apple ProRes 422 HQ (.mov - Lossless 10-bit, PCM 48kHz)"
+    Show-MenuItem '8'  "Premiere Pro: Lossless H.264 (.mp4 - CRF 0, YUV420p, 48kHz)"
+    Show-MenuItem '9'  "H.264 Standard (MP4)"
+    Show-MenuItem '10' "H.265 / HEVC"
+    Show-MenuItem '11' "AV1"
     Write-Host ""
 
-    $choice = Read-UserChoice -Prompt "Select quality" -Max 8
+    $choice = Read-UserChoice -Prompt "Select quality" -Max 11
     if ($null -eq $choice) { Wait-User; return }
     
     $formatMap = @{
-        '1'='best'; '2'='h264'; '3'='h265'; '4'='av1';
-        '5'='720p'; '6'='1080p'; '7'='1440p'; '8'='4k'
+        '1'='preferred'; '2'='best'; '3'='1080p'; '4'='720p';
+        '5'='4k'; '6'='1440p'; '7'='premiere-prores'; '8'='premiere-lossless';
+        '9'='h264'; '10'='h265'; '11'='av1'
     }
     $FormatType = $formatMap[$choice]
 
     $descriptions = @{
-        'best'  = 'Best Quality Video'
-        'h264'  = 'H.264 Video (Premiere-friendly)'
-        'h265'  = 'H.265 / HEVC Video'
-        'av1'   = 'AV1 Video'
-        '720p'  = '720p Video'
-        '1080p' = '1080p Video'
-        '1440p' = '1440p Video'
-        '4k'    = '4K Video'
+        'preferred'         = "Preferred Video ($prefRes, $prefCodec)"
+        'best'              = 'Best Quality Video'
+        '1080p'             = '1080p Video'
+        '720p'              = '720p Video'
+        '4k'                = '4K Video'
+        '1440p'             = '1440p Video'
+        'premiere-prores'   = 'Premiere Pro Lossless ProRes 422 HQ (.mov)'
+        'premiere-lossless' = 'Premiere Pro Lossless H.264 (.mp4)'
+        'h264'              = 'H.264 Video (Premiere-friendly)'
+        'h265'              = 'H.265 / HEVC Video'
+        'av1'               = 'AV1 Video'
     }
 
-    $formatArgs = Get-VideoFormatArgs -FormatType $FormatType
+    $formatArgs = if ($FormatType -eq 'preferred') {
+        Get-PreferredVideoFormatArgs
+    } else {
+        Get-VideoFormatArgs -FormatType $FormatType
+    }
     $extraArgs = @('--no-playlist') + $formatArgs
 
     $null = Invoke-Download -Url $url -Type 'video' -ExtraArgs $extraArgs `
@@ -1832,23 +2102,26 @@ function Start-AudioDownload {
     $url = Read-UserInput -Prompt "Enter video/audio URL" -Required -IsUrl
     if ($null -eq $url) { Wait-User; return }
 
-    Write-Host ""
-    Write-Color "  Select Audio Format:" $Script:Colors.Heading
-    Show-MenuItem '1' "MP3 (Default)"
-    Show-MenuItem '2' "FLAC (Lossless)"
-    Show-MenuItem '3' "WAV (Lossless)"
-    Show-MenuItem '4' "M4A"
-    Show-MenuItem '5' "OPUS"
-    Write-Host ""
-
-    $choice = Read-UserChoice -Prompt "Select format" -Max 5
-    if ($null -eq $choice) { Wait-User; return }
-    
-    $formatMap = @{ '1'='mp3'; '2'='flac'; '3'='wav'; '4'='m4a'; '5'='opus' }
-    $Format = $formatMap[$choice]
-
+    $prefFmt = Get-Setting 'Audio' 'PreferredFormat'
+    if (-not $prefFmt) { $prefFmt = 'mp3' }
     $quality = Get-Setting 'Audio' 'PreferredQuality'
     if ([string]::IsNullOrEmpty($quality)) { $quality = '320' }
+
+    Write-Host ""
+    Write-Color "  Select Audio Format:" $Script:Colors.Heading
+    Show-MenuItem '1' "Preferred Format ($($prefFmt.ToUpper()) - ${quality}K)"
+    Show-MenuItem '2' "MP3 (320 kbps - Most Compatible)"
+    Show-MenuItem '3' "FLAC (Lossless Studio Quality)"
+    Show-MenuItem '4' "WAV (Uncompressed Lossless)"
+    Show-MenuItem '5' "M4A / AAC"
+    Show-MenuItem '6' "OPUS"
+    Write-Host ""
+
+    $choice = Read-UserChoice -Prompt "Select format" -Max 6
+    if ($null -eq $choice) { Wait-User; return }
+    
+    $formatMap = @{ '1'=$prefFmt; '2'='mp3'; '3'='flac'; '4'='wav'; '5'='m4a'; '6'='opus' }
+    $Format = $formatMap[$choice]
 
     $extraArgs = @(
         '--no-playlist'
@@ -1859,6 +2132,193 @@ function Start-AudioDownload {
 
     $null = Invoke-Download -Url $url -Type 'audio' -ExtraArgs $extraArgs `
         -OutputDir $Script:DownloadDirs.Music -Description "$([string]$Format.ToUpper()) audio"
+
+    Wait-User
+}
+
+#endregion
+
+# ===============================================================================
+#  CLIP DOWNLOADS
+# ===============================================================================
+#region ClipDownloads
+
+function Start-ClipDownload {
+    Clear-Screen
+    Show-SectionHeader "Download Specific Time Range / Clip"
+
+    $url = Read-UserInput -Prompt "Enter video/audio URL" -Required -IsUrl
+    if ($null -eq $url) { Wait-User; return }
+
+    $info = Get-MediaInfo $url
+    if ($info.Error) {
+        Show-Error -RawError $info.Error
+        Wait-User
+        return
+    }
+
+    Show-MediaInfoCard $info
+
+    Write-Host ""
+    Write-Color "  Enter time range (Format: HH:MM:SS or MM:SS, e.g. 01:30 or 00:02:15)" $Script:Colors.Info
+    $startTime = Read-UserInput -Prompt "Start time" -Required
+    if ($null -eq $startTime) { Wait-User; return }
+
+    $endTime = Read-UserInput -Prompt "End time (or leave blank to download until the end)" -AllowEmpty
+
+    $sectionArg = if ([string]::IsNullOrWhiteSpace($endTime)) {
+        "*$startTime-inf"
+    } else {
+        "*$startTime-$endTime"
+    }
+
+    Write-Host ""
+    Write-Host "   1. Video (Best Quality)"
+    Write-Host "   2. Video (1080p MP4)"
+    Write-Host "   3. Audio only (MP3)"
+    Write-Host "   4. Audio only (FLAC)"
+    Write-Host "   0. Cancel"
+
+    $choice = Read-UserChoice -Prompt "Select format" -Max 4 -AllowZero
+    if ($choice -eq '0' -or $null -eq $choice) { return }
+
+    $extraArgs = @('--download-sections', $sectionArg, '--force-keyframes-at-cuts', '--no-playlist')
+    $outputDir = $Script:DownloadDirs.Videos
+
+    switch ($choice) {
+        '1' { $extraArgs += @('-f', 'bv*+ba/b', '--merge-output-format', 'mkv') }
+        '2' { $extraArgs += @('-f', 'bv*[height<=1080]+ba/b', '--merge-output-format', 'mp4') }
+        '3' {
+            $extraArgs += @('-x', '--audio-format', 'mp3', '--audio-quality', '320K')
+            $outputDir = $Script:DownloadDirs.Music
+        }
+        '4' {
+            $extraArgs += @('-x', '--audio-format', 'flac')
+            $outputDir = $Script:DownloadDirs.Music
+        }
+    }
+
+    $null = Invoke-Download -Url $url -Type 'clip' -ExtraArgs $extraArgs `
+        -OutputDir $outputDir -Description "Clip ($sectionArg)"
+
+    Wait-User
+}
+
+#endregion
+
+# ===============================================================================
+#  SEARCH & DOWNLOAD
+# ===============================================================================
+#region SearchDownloads
+
+function Start-YouTubeSearch {
+    Clear-Screen
+    Show-SectionHeader "Search YouTube & Download"
+
+    $query = Read-UserInput -Prompt "Enter search query (keywords or song title)" -Required
+    if ($null -eq $query) { Wait-User; return }
+
+    Write-Status "Searching YouTube for: '$query'..." -Type Working
+
+    $argsList = @(
+        '--default-search', 'ytsearch5',
+        '--flat-playlist',
+        '--dump-json',
+        '--no-warnings'
+    )
+    $cookieBrowser = Get-Setting 'Network' 'CookieBrowser'
+    if ($cookieBrowser -and $cookieBrowser -ne 'none') {
+        $argsList += @('--cookies-from-browser', $cookieBrowser)
+    }
+    $argsList += "ytsearch5:$query"
+
+    try {
+        $oldEap = $ErrorActionPreference
+        $ErrorActionPreference = 'SilentlyContinue'
+        $output = & $Script:YtDlpPath @argsList 2>&1
+        $ErrorActionPreference = $oldEap
+
+        $jsonLines = ($output | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] }) | Out-String
+        $lines = $jsonLines.Split("`n") | Where-Object { $_.Trim() -ne '' }
+
+        if ($lines.Count -eq 0) {
+            Write-Status "No search results found." -Type Warning
+            Wait-User
+            return
+        }
+
+        Write-Host ""
+        Write-Color "  Search Results:" $Script:Colors.Heading
+        Write-Color "  $('-' * 60)" $Script:Colors.Muted
+
+        $results = @()
+        for ($i = 0; $i -lt $lines.Count; $i++) {
+            $item = $lines[$i] | ConvertFrom-Json -ErrorAction SilentlyContinue
+            if ($item -and $item.id) {
+                $videoUrl = if ($item.url -and (Test-UrlValid $item.url)) { $item.url } else { "https://www.youtube.com/watch?v=$($item.id)" }
+                $duration = if ($item.duration) { Format-Duration ([int]$item.duration) } else { '--:--' }
+                $uploader = if ($item.uploader) { $item.uploader } else { 'Unknown' }
+                $results += @{
+                    Index    = $results.Count + 1
+                    Title    = $item.title
+                    Uploader = $uploader
+                    Duration = $duration
+                    Url      = $videoUrl
+                }
+
+                $numStr = "   $($results.Count). "
+                Write-Color $numStr $Script:Colors.MenuNum -NoNewline
+                Write-Color "$($item.title)" $Script:Colors.Primary -NoNewline
+                Write-Color " [$duration - $uploader]" $Script:Colors.Muted
+            }
+        }
+
+        if ($results.Count -eq 0) {
+            Write-Status "Could not parse search results." -Type Warning
+            Wait-User
+            return
+        }
+
+        Write-Host ""
+        Write-Host "   0. Cancel"
+
+        $sel = Read-UserChoice -Prompt "Select video to download" -Max $results.Count -AllowZero
+        if ($sel -eq '0' -or $null -eq $sel) { return }
+
+        $chosen = $results[[int]$sel - 1]
+
+        Write-Host ""
+        Write-Color "  Selected: $($chosen.Title)" $Script:Colors.Heading
+        Write-Host "   1. Download as Video (Best)"
+        Write-Host "   2. Download as Video (1080p MP4)"
+        Write-Host "   3. Download as Audio (MP3)"
+        Write-Host "   4. Download as Audio (FLAC)"
+        Write-Host "   0. Cancel"
+
+        $fmtChoice = Read-UserChoice -Prompt "Select format" -Max 4 -AllowZero
+        if ($fmtChoice -eq '0' -or $null -eq $fmtChoice) { return }
+
+        switch ($fmtChoice) {
+            '1' {
+                $extraArgs = @('--no-playlist', '-f', 'bv*+ba/b', '--merge-output-format', 'mkv')
+                $null = Invoke-Download -Url $chosen.Url -Type 'video' -ExtraArgs $extraArgs -OutputDir $Script:DownloadDirs.Videos -Description $chosen.Title
+            }
+            '2' {
+                $extraArgs = @('--no-playlist', '-f', 'bv*[height<=1080]+ba/b', '--merge-output-format', 'mp4')
+                $null = Invoke-Download -Url $chosen.Url -Type 'video' -ExtraArgs $extraArgs -OutputDir $Script:DownloadDirs.Videos -Description $chosen.Title
+            }
+            '3' {
+                $extraArgs = @('--no-playlist', '-x', '--audio-format', 'mp3', '--audio-quality', '320K')
+                $null = Invoke-Download -Url $chosen.Url -Type 'audio' -ExtraArgs $extraArgs -OutputDir $Script:DownloadDirs.Music -Description $chosen.Title
+            }
+            '4' {
+                $extraArgs = @('--no-playlist', '-x', '--audio-format', 'flac')
+                $null = Invoke-Download -Url $chosen.Url -Type 'audio' -ExtraArgs $extraArgs -OutputDir $Script:DownloadDirs.Music -Description $chosen.Title
+            }
+        }
+    } catch {
+        Write-Status "Search failed: $($_.Exception.Message)" -Type Error
+    }
 
     Wait-User
 }
@@ -1898,9 +2358,10 @@ function Start-PlaylistDownload {
     Write-Host "   1. Download entire playlist"
     Write-Host "   2. Download specific range (e.g., 1-10)"
     Write-Host "   3. Download single video by index"
+    Write-Host "   4. Download in reverse order (newest first)"
     Write-Host "   0. Cancel"
 
-    $choice = Read-UserChoice -Prompt "Select option" -Max 3 -AllowZero
+    $choice = Read-UserChoice -Prompt "Select option" -Max 4 -AllowZero
     if ($choice -eq '0' -or $null -eq $choice) { return }
 
     if ([string]::IsNullOrEmpty($FormatType)) {
@@ -1927,7 +2388,7 @@ function Start-PlaylistDownload {
         $extraArgs = @('--yes-playlist') + $formatArgs
     }
 
-    $playlistTemplate = Join-Path $Script:DownloadDirs.Playlists '%(playlist_title)s/%(playlist_index)03d - %(title)s.%(ext)s'
+    $playlistTemplate = Join-Path $Script:DownloadBaseDir '%(playlist_index)02d - %(title)s.%(ext)s'
     $extraArgs += @('-o', $playlistTemplate)
 
     switch ($choice) {
@@ -1940,6 +2401,9 @@ function Start-PlaylistDownload {
             $index = Read-UserInput -Prompt "Enter video number" -Required
             if ($null -eq $index) { Wait-User; return }
             $extraArgs += @('--playlist-items', $index)
+        }
+        '4' {
+            $extraArgs += @('--playlist-reverse')
         }
     }
 
@@ -2292,26 +2756,57 @@ function Start-BatchDownload {
     Clear-Screen
     Show-SectionHeader "Batch Download"
 
-    Write-Color "  Enter URLs one per line." $Script:Colors.Info
-    Write-Color "  Enter a blank line when done." $Script:Colors.Muted
     Write-Host ""
+    Write-Host "   1. Enter URLs manually (line-by-line)"
+    Write-Host "   2. Import URLs from a text file (.txt)"
+    Write-Host "   0. Cancel"
+
+    $batchMode = Read-UserChoice -Prompt "Select option" -Max 2 -AllowZero
+    if ($batchMode -eq '0' -or $null -eq $batchMode) { return }
 
     $urls = [System.Collections.ArrayList]@()
-    $lineNum = 1
-    while ($true) {
-        Write-Color "  [$lineNum] " $Script:Colors.Muted -NoNewline
-        $line = Read-Host
-        if ([string]::IsNullOrWhiteSpace($line)) { break }
-        if (Test-UrlValid $line.Trim()) {
-            [void]$urls.Add($line.Trim())
-            $lineNum++
-        } else {
-            Write-Color "  Invalid URL, skipped." $Script:Colors.Warning
+
+    if ($batchMode -eq '2') {
+        Write-Host ""
+        $filePath = Read-UserInput -Prompt "Enter path to .txt file (e.g. urls.txt)" -Required
+        if ($null -eq $filePath) { Wait-User; return }
+        if (-not [System.IO.Path]::IsPathRooted($filePath)) {
+            $filePath = Join-Path $Script:ToolkitRoot $filePath
+        }
+        if (-not (Test-Path $filePath)) {
+            Show-Error -CustomMessage "File not found: $filePath"
+            Wait-User
+            return
+        }
+        foreach ($line in (Get-Content $filePath -ErrorAction SilentlyContinue)) {
+            $cleanLine = $line.Trim()
+            if (-not [string]::IsNullOrWhiteSpace($cleanLine) -and -not $cleanLine.StartsWith('#') -and (Test-UrlValid $cleanLine)) {
+                [void]$urls.Add($cleanLine)
+            }
+        }
+        Write-Status "Loaded $($urls.Count) valid URL(s) from $(Split-Path $filePath -Leaf)" -Type Success
+    } else {
+        Write-Host ""
+        Write-Color "  Enter URLs one per line." $Script:Colors.Info
+        Write-Color "  Enter a blank line when done." $Script:Colors.Muted
+        Write-Host ""
+
+        $lineNum = 1
+        while ($true) {
+            Write-Color "  [$lineNum] " $Script:Colors.Muted -NoNewline
+            $line = Read-Host
+            if ([string]::IsNullOrWhiteSpace($line)) { break }
+            if (Test-UrlValid $line.Trim()) {
+                [void]$urls.Add($line.Trim())
+                $lineNum++
+            } else {
+                Write-Color "  Invalid URL, skipped." $Script:Colors.Warning
+            }
         }
     }
 
     if ($urls.Count -eq 0) {
-        Write-Status "No valid URLs entered." -Type Warning
+        Write-Status "No valid URLs entered or loaded." -Type Warning
         Wait-User
         return
     }
@@ -2374,11 +2869,51 @@ function Start-FileConversion {
     Clear-Screen
     Show-SectionHeader "Convert Existing File"
 
-    $inputPath = Read-UserInput -Prompt "Enter path to the file" -Required
-    if ($null -eq $inputPath) { Wait-User; return }
+    $downloadFiles = @()
+    if (Test-Path $Script:DownloadBaseDir) {
+        $downloadFiles = @(Get-ChildItem -Path $Script:DownloadBaseDir -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.Extension -match '\.(mp4|mkv|webm|avi|flv|mov|ts|m4v|mp3|m4a|wav|flac|opus|ogg|aac)$' } |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 10)
+    }
 
-    if (-not [System.IO.Path]::IsPathRooted($inputPath)) {
-        $inputPath = Join-Path $Script:ToolkitRoot $inputPath
+    $inputPath = ''
+    if ($downloadFiles.Count -gt 0) {
+        Write-Color "  Files in downloads folder:" $Script:Colors.Heading
+        for ($i = 0; $i -lt $downloadFiles.Count; $i++) {
+            $f = $downloadFiles[$i]
+            $fSize = Format-FileSize $f.Length
+            Write-Host "   $($i + 1). " -ForegroundColor $Script:Colors.MenuNum -NoNewline
+            Write-Host "$($f.Name)" -ForegroundColor $Script:Colors.Primary -NoNewline
+            Write-Host " ($fSize)" -ForegroundColor $Script:Colors.Muted
+        }
+        Write-Host ""
+        $userChoice = Read-UserInput -Prompt "Enter number to select file, or enter / drag-and-drop file path" -Required
+        if ($null -eq $userChoice) { Wait-User; return }
+
+        if ($userChoice -match '^\d+$' -and [int]$userChoice -ge 1 -and [int]$userChoice -le $downloadFiles.Count) {
+            $inputPath = $downloadFiles[[int]$userChoice - 1].FullName
+        } else {
+            $inputPath = $userChoice
+        }
+    } else {
+        $inputPath = Read-UserInput -Prompt "Enter path to the file (or drag and drop file here)" -Required
+        if ($null -eq $inputPath) { Wait-User; return }
+    }
+
+    # Clean and sanitize input path from drag-and-drop and quotes
+    $inputPath = $inputPath.Trim()
+    if ($inputPath -match '^["''](.*)["'']$') { $inputPath = $Matches[1].Trim() }
+    if ($inputPath -match '^&\s*["''](.*)["'']$') { $inputPath = $Matches[1].Trim() }
+    $inputPath = $inputPath.Replace('"', '').Replace("'", '')
+
+    try {
+        if (-not [System.IO.Path]::IsPathRooted($inputPath)) {
+            $inputPath = Join-Path $Script:ToolkitRoot $inputPath
+        }
+    } catch {
+        Show-Error -CustomMessage "Invalid file path format: $inputPath"
+        Wait-User
+        return
     }
 
     if (-not (Test-Path $inputPath)) {
@@ -2398,29 +2933,56 @@ function Start-FileConversion {
     Write-Color "  Format:      $ext" $Script:Colors.Muted
 
     Write-Host ""
-    Write-Color "  Convert to:" $Script:Colors.Heading
-    Write-Host "   1. MP4 (video)"
-    Write-Host "   2. MKV (video)"
-    Write-Host "   3. AVI (video)"
-    Write-Host "   4. MP3 (audio)"
-    Write-Host "   5. FLAC (audio)"
-    Write-Host "   6. WAV (audio)"
-    Write-Host "   7. M4A (audio)"
-    Write-Host "   8. AAC (audio)"
-    Write-Host "   0. Cancel"
+    Write-Color "  Select Output Format:" $Script:Colors.Heading
+    Write-Host ""
+    Write-Color "  -- ADOBE PREMIERE PRO (LOSSLESS / EDITING) --" $Script:Colors.Accent
+    Show-MenuItem '1'  "Apple ProRes 422 HQ (.mov)" "10-bit intra-frame, zero scrub lag, PCM 48kHz"
+    Show-MenuItem '2'  "Premiere Lossless H.264 (.mp4)" "CRF 0 mathematical lossless, YUV420p, 48kHz"
+    Show-MenuItem '3'  "Fast Remux to MP4 (.mp4)" "Instant copy without re-encoding, 48kHz audio"
+    Show-MenuItem '4'  "Avid DNxHD / DNxHR (.mov)" "Broadcast editing standard, PCM 48kHz"
+    Write-Host ""
+    Write-Color "  -- STANDARD VIDEO --" $Script:Colors.Accent
+    Show-MenuItem '5'  "MP4 (High Quality H.264)" "CRF 18 visually lossless, high compatibility"
+    Show-MenuItem '6'  "MKV (Stream copy)" "Lossless container remux"
+    Show-MenuItem '7'  "AVI (Legacy video)" "Standard AVI container"
+    Write-Host ""
+    Write-Color "  -- AUDIO EXTRACTION --" $Script:Colors.Accent
+    Show-MenuItem '8'  "WAV Audio (Broadcast Lossless)" "PCM 24-bit 48kHz - Premiere timeline standard"
+    Show-MenuItem '9'  "MP3 Audio (320 kbps)" "Maximum quality MP3"
+    Show-MenuItem '10' "FLAC Audio (Lossless)" "Compressed lossless audio"
+    Show-MenuItem '11' "M4A / AAC Audio" "Apple / Mobile compatible"
+    Write-Host ""
+    Show-MenuItem '0'  "Cancel"
 
-    $choice = Read-UserChoice -Prompt "Select format" -Max 8 -AllowZero
+    $choice = Read-UserChoice -Prompt "Select format" -Max 11 -AllowZero
     if ($choice -eq '0' -or $null -eq $choice) { return }
 
     $outputExt = switch ($choice) {
-        '1' { '.mp4' }
-        '2' { '.mkv' }
-        '3' { '.avi' }
-        '4' { '.mp3' }
-        '5' { '.flac' }
-        '6' { '.wav' }
-        '7' { '.m4a' }
-        '8' { '.aac' }
+        '1'  { '.mov' }
+        '2'  { '.mp4' }
+        '3'  { '.mp4' }
+        '4'  { '.mov' }
+        '5'  { '.mp4' }
+        '6'  { '.mkv' }
+        '7'  { '.avi' }
+        '8'  { '.wav' }
+        '9'  { '.mp3' }
+        '10' { '.flac' }
+        '11' { '.m4a' }
+    }
+
+    $ffmpegCustomArgs = switch ($choice) {
+        '1'  { "-map 0:v -map 0:a? -c:v prores_ks -profile:v 3 -c:a pcm_s16le -ar 48000" }
+        '2'  { "-map 0:v -map 0:a? -c:v libx264 -crf 0 -preset veryfast -pix_fmt yuv420p -c:a aac -b:a 320k -ar 48000" }
+        '3'  { "-map 0:v -map 0:a? -c:v copy -c:a aac -b:a 320k -ar 48000" }
+        '4'  { "-map 0:v -map 0:a? -c:v dnxhd -profile:v dnxhr_hq -pix_fmt yuv422p -c:a pcm_s16le -ar 48000" }
+        '5'  { "-map 0:v -map 0:a? -c:v libx264 -crf 18 -preset fast -pix_fmt yuv420p -c:a aac -b:a 256k -ar 48000" }
+        '6'  { "-c:v copy -c:a copy" }
+        '7'  { "-map 0:v -map 0:a? -c:v msmpeg4v2 -c:a mp3" }
+        '8'  { "-vn -c:a pcm_s24le -ar 48000" }
+        '9'  { "-vn -c:a libmp3lame -b:a 320k" }
+        '10' { "-vn -c:a flac" }
+        '11' { "-vn -c:a aac -b:a 256k" }
     }
 
     $baseName = [System.IO.Path]::GetFileNameWithoutExtension($inputPath)
@@ -2442,25 +3004,102 @@ function Start-FileConversion {
         }
     }
 
-    Write-Status "Converting to $outputExt..." -Type Working
+    Write-Status "Converting to $outputExt... This may take a while." -Type Working
+    Write-Host ""
 
-    $ffmpegErrFile = Join-Path $Script:TempDir 'ffmpeg_err.txt'
-    $ffmpegArgs = @('-i', $inputPath, '-y', $outputPath)
+    # Add -stats to force FFmpeg to output progress to stderr
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $Script:FFmpegPath
+    $psi.Arguments = "-i `"$inputPath`" $ffmpegCustomArgs -stats -y `"$outputPath`""
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.CreateNoWindow = $true
+    $psi.StandardErrorEncoding = [System.Text.Encoding]::UTF8
+    $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8
+
+    $proc = New-Object System.Diagnostics.Process
+    $proc.StartInfo = $psi
+
     try {
-        $proc = Start-Process -FilePath $Script:FFmpegPath -ArgumentList $ffmpegArgs `
-            -NoNewWindow -PassThru -Wait -RedirectStandardError $ffmpegErrFile
+        $proc.Start() | Out-Null
 
-        if ($proc.ExitCode -eq 0) {
-            Write-Status "Conversion complete: $(Split-Path $outputPath -Leaf)" -Type Success
+        # Read stdout async to prevent deadlock (FFmpeg writes nothing to stdout)
+        $stdoutTask = $proc.StandardOutput.ReadToEndAsync()
+        $stderrAccum = [System.Text.StringBuilder]::new()
+        $conversionStartTime = Get-Date
+        $spinnerChars = @('|', '/', '-', '\')
+        $sIdx = 0
+        $lastProgressLine = ''
+        $hitError = $false
+
+        # Read stderr async line-by-line with spinner fallback
+        $stderrLineTask = $proc.StandardError.ReadLineAsync()
+
+        while (-not $proc.HasExited -or ($null -ne $stderrLineTask)) {
+            if ($null -ne $stderrLineTask -and $stderrLineTask.IsCompleted) {
+                $line = $stderrLineTask.GetAwaiter().GetResult()
+                if ($null -ne $line) {
+                    [void]$stderrAccum.AppendLine($line)
+
+                    # Parse FFmpeg progress lines: "frame= 1234 ... time=00:01:23.45 ... speed=2.5x"
+                    if ($line -match 'frame=\s*(\d+)\s+fps=\s*([\d.]+)\s+.*time=(\S+)') {
+                        $frame = $Matches[1]
+                        $fps   = $Matches[2]
+                        $time  = $Matches[3]
+                        $elapsedSec = [int]((Get-Date) - $conversionStartTime).TotalSeconds
+                        $elapsed = [TimeSpan]::FromSeconds($elapsedSec).ToString('mm\:ss')
+                        $lastProgressLine = "frame $frame | fps $fps | time $time | Elapsed: $elapsed"
+                        Write-Host "`r  [..] Converting... $lastProgressLine    " -ForegroundColor $Script:Colors.Info -NoNewline
+                    }
+                    elseif ($line -match 'Conversion failed|Invalid argument|Error|codec not') {
+                        $hitError = $true
+                        Write-Log 'ERROR' "[ffmpeg] $line"
+                    }
+
+                    $stderrLineTask = $proc.StandardError.ReadLineAsync()
+                } else {
+                    $stderrLineTask = $null
+                }
+            } else {
+                # Show spinner while waiting
+                $elapsedSec = [int]((Get-Date) - $conversionStartTime).TotalSeconds
+                $elapsed = [TimeSpan]::FromSeconds($elapsedSec).ToString('mm\:ss')
+                $s = $spinnerChars[$sIdx % $spinnerChars.Count]
+                $sIdx++
+                if ($lastProgressLine) {
+                    Write-Host "`r  [$s] Converting... $lastProgressLine    " -ForegroundColor $Script:Colors.Info -NoNewline
+                } else {
+                    Write-Host "`r  [$s] Converting... Elapsed: $elapsed    " -ForegroundColor $Script:Colors.Info -NoNewline
+                }
+                Start-Sleep -Milliseconds 250
+            }
+
+            if ($null -eq $stderrLineTask) { break }
+        }
+
+        if (-not $proc.HasExited) { $proc.WaitForExit() }
+        $null = $stdoutTask.GetAwaiter().GetResult()
+        Write-Host "`r".PadRight(90) -NoNewline
+        Write-Host ""
+
+        if ($proc.ExitCode -eq 0 -and (Test-Path $outputPath)) {
+            $outSize = Format-FileSize (Get-Item $outputPath).Length
+            Write-Status "Conversion complete: $(Split-Path $outputPath -Leaf) ($outSize)" -Type Success
         } else {
-            $errContent = Get-Content $ffmpegErrFile -Raw -ErrorAction SilentlyContinue
-            Show-Error -RawError $errContent -CustomMessage "Conversion failed"
+            $stderrText = $stderrAccum.ToString()
+            if ($stderrText -match 'Conversion failed') {
+                Show-Error -CustomMessage "FFmpeg conversion failed. The source file may have incompatible streams."
+            } elseif ($stderrText -match 'No such file') {
+                Show-Error -CustomMessage "FFmpeg could not find the input file."
+            } else {
+                Show-Error -CustomMessage "Conversion failed (FFmpeg exit code $($proc.ExitCode))"
+            }
+            Write-Log 'ERROR' "FFmpeg stderr: $stderrText"
         }
     } catch {
         Show-Error -CustomMessage "FFmpeg error: $($_.Exception.Message)"
     }
-
-    Remove-Item $ffmpegErrFile -Force -ErrorAction SilentlyContinue
     Wait-User
 }
 
@@ -2481,12 +3120,23 @@ function Add-HistoryEntry {
         [string]$Duration = '',
         [string]$Status = 'Success'
     )
-    $date = Get-Date -Format 'yyyy-MM-dd'
-    $time = Get-Date -Format 'HH:mm:ss'
-    $safeTitle = $Title -replace ',', ';'
-    $entry = "$date,$time,$Url,$safeTitle,$Website,$OutputDir,$FileSize,$Duration,$Status"
+    $obj = [PSCustomObject]@{
+        Date       = (Get-Date -Format 'yyyy-MM-dd')
+        Time       = (Get-Date -Format 'HH:mm:ss')
+        Url        = $Url
+        Title      = $Title
+        Website    = $Website
+        OutputPath = $OutputDir
+        FileSize   = $FileSize
+        Duration   = $Duration
+        Status     = $Status
+    }
     try {
-        $entry | Out-File -FilePath $Script:HistoryFile -Encoding UTF8 -Append
+        if (-not (Test-Path $Script:HistoryFile)) {
+            $obj | Export-Csv -Path $Script:HistoryFile -NoTypeInformation -Encoding UTF8
+        } else {
+            $obj | Export-Csv -Path $Script:HistoryFile -Append -NoTypeInformation -Encoding UTF8
+        }
         Write-Log 'INFO' "History entry added: $Status -- $Title"
     } catch {
         Write-Log 'WARN' "Failed to write history: $($_.Exception.Message)"
@@ -2496,6 +3146,13 @@ function Add-HistoryEntry {
 function Get-History {
     param([int]$Limit = 50)
     if (-not (Test-Path $Script:HistoryFile)) { return @() }
+    try {
+        $csv = Import-Csv $Script:HistoryFile -ErrorAction SilentlyContinue
+        if ($csv) {
+            return @($csv | Select-Object -Last $Limit)
+        }
+    } catch { }
+
     $lines = Get-Content $Script:HistoryFile -ErrorAction SilentlyContinue | Select-Object -Skip 1
     if ($null -eq $lines -or $lines.Count -eq 0) { return @() }
 
@@ -2503,16 +3160,16 @@ function Get-History {
     foreach ($line in ($lines | Select-Object -Last $Limit)) {
         $parts = $line -split ','
         if ($parts.Count -ge 9) {
-            $entries += @{
-                Date      = $parts[0]
-                Time      = $parts[1]
-                Url       = $parts[2]
-                Title     = $parts[3]
-                Website   = $parts[4]
-                OutputDir = $parts[5]
-                FileSize  = $parts[6]
-                Duration  = $parts[7]
-                Status    = $parts[8]
+            $entries += [PSCustomObject]@{
+                Date       = $parts[0]
+                Time       = $parts[1]
+                Url        = $parts[2]
+                Title      = $parts[3]
+                Website    = $parts[4]
+                OutputPath = $parts[5]
+                FileSize   = $parts[6]
+                Duration   = $parts[7]
+                Status     = $parts[8]
             }
         }
     }
@@ -2581,14 +3238,12 @@ function Remove-TempFiles {
 
 function Remove-PartialDownloads {
     $count = 0
-    foreach ($dir in $Script:DownloadDirs.Values) {
-        if (Test-Path $dir) {
-            Get-ChildItem -Path $dir -Recurse -Filter '*.part' -ErrorAction SilentlyContinue |
-                ForEach-Object {
-                    Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue
-                    $count++
-                }
-        }
+    if (Test-Path $Script:DownloadBaseDir) {
+        Get-ChildItem -Path $Script:DownloadBaseDir -Recurse -Filter '*.part' -ErrorAction SilentlyContinue |
+            ForEach-Object {
+                Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue
+                $count++
+            }
     }
     if ($count -gt 0) {
         Write-Log 'INFO' "Removed $count partial download(s)."
@@ -2612,11 +3267,9 @@ function Invoke-SessionCleanup {
 
 function Test-UnfinishedDownloads {
     $partFiles = @()
-    foreach ($dir in $Script:DownloadDirs.Values) {
-        if (Test-Path $dir) {
-            $parts = Get-ChildItem -Path $dir -Recurse -Filter '*.part' -ErrorAction SilentlyContinue
-            if ($parts) { $partFiles += $parts }
-        }
+    if (Test-Path $Script:DownloadBaseDir) {
+        $parts = Get-ChildItem -Path $Script:DownloadBaseDir -Recurse -Filter '*.part' -ErrorAction SilentlyContinue
+        if ($parts) { $partFiles += $parts }
     }
 
     $tempFiles = @()
@@ -2669,9 +3322,18 @@ function Show-SettingsMenu {
         $autoUp   = Get-Setting 'General' 'AutoUpdate'
         $autoOpen = Get-Setting 'General' 'AutoOpenFolder'
         $retry    = Get-Setting 'General' 'RetryCount'
+        $dlFolder = Get-Setting 'General' 'DownloadFolder'
+        $theme    = Get-Setting 'General' 'Theme'
+        $autoUp   = Get-Setting 'General' 'AutoUpdate'
+        $autoOpen = Get-Setting 'General' 'AutoOpenFolder'
+        $retry    = Get-Setting 'General' 'RetryCount'
         $diskWarn = Get-Setting 'General' 'DiskWarningThresholdGB'
+        $concFrag = Get-Setting 'General' 'ConcurrentFragments'
+        $speedLim = Get-Setting 'General' 'SpeedLimit'
         $vCodec   = Get-Setting 'Video'   'PreferredCodec'
         $vRes     = Get-Setting 'Video'   'PreferredResolution'
+        $embSub   = Get-Setting 'Video'   'EmbedSubtitles'
+        $embCh    = Get-Setting 'Video'   'EmbedChapters'
         $aFmt     = Get-Setting 'Audio'   'PreferredFormat'
         $aQual    = Get-Setting 'Audio'   'PreferredQuality'
         $embedMd  = Get-Setting 'Downloads' 'EmbedMetadata'
@@ -2682,39 +3344,72 @@ function Show-SettingsMenu {
         $proxy    = Get-Setting 'Network' 'Proxy'
         $sbOn     = Get-Setting 'SponsorBlock' 'Enabled'
 
-        Show-MenuItem '1'  "Download Folder"        "[$dlFolder]"
-        Show-MenuItem '2'  "Preferred Video Codec"  "[$vCodec]"
-        Show-MenuItem '3'  "Preferred Resolution"   "[$vRes]"
-        Show-MenuItem '4'  "Audio Format"           "[$aFmt]"
-        Show-MenuItem '5'  "Audio Quality"          "[${aQual}K]"
-        Show-MenuItem '6'  "Theme"                  "[$theme]"
-        Show-MenuItem '7'  "Retry Count"            "[$retry]"
-        Show-MenuItem '8'  "Auto Update"            "[$autoUp]"
-        Show-MenuItem '9'  "Auto Open Folder"       "[$autoOpen]"
-        Show-MenuItem '10' "Embed Metadata"         "[$embedMd]"
-        Show-MenuItem '11' "Embed Thumbnails"       "[$embedTh]"
-        Show-MenuItem '12' "Archive Mode"           "[$archive]"
-        Show-MenuItem '13' "Filename Template"      "[$fnTpl]"
-        Show-MenuItem '14' "Browser Cookies"        "[$cookies]"
-        Show-MenuItem '15' "Proxy"                  "[$(if($proxy){$proxy}else{'none'})]"
-        Show-MenuItem '16' "SponsorBlock"           "[$(if($sbOn -eq 'true'){'On'}else{'Off'})]"
-        Show-MenuItem '17' "Disk Warning (GB)"      "[$diskWarn]"
+        Show-MenuItem '1'  "Download Folder"          "[$dlFolder]"
+        Show-MenuItem '2'  "Preferred Video Codec"    "[$vCodec]"
+        Show-MenuItem '3'  "Preferred Resolution"     "[$vRes]"
+        Show-MenuItem '4'  "Audio Format"             "[$aFmt]"
+        Show-MenuItem '5'  "Audio Quality"            "[${aQual}K]"
+        Show-MenuItem '6'  "Concurrent Threads"       "[$concFrag threads]"
+        Show-MenuItem '7'  "Download Speed Limit"     "[$(if($speedLim -and $speedLim -ne '0'){$speedLim}else{'Unlimited'})]"
+        Show-MenuItem '8'  "Embed Subtitles in Video" "[$(if($embSub -eq 'true'){'Yes'}else{'No'})]"
+        Show-MenuItem '9'  "Embed Chapters in Video"  "[$(if($embCh -eq 'true'){'Yes'}else{'No'})]"
+        Show-MenuItem '10' "Embed Metadata"           "[$embedMd]"
+        Show-MenuItem '11' "Embed Thumbnails"         "[$embedTh]"
+        Show-MenuItem '12' "Archive Mode"             "[$archive]"
+        Show-MenuItem '13' "Theme"                    "[$theme]"
+        Show-MenuItem '14' "Retry Count"              "[$retry]"
+        Show-MenuItem '15' "Auto Update"              "[$autoUp]"
+        Show-MenuItem '16' "Auto Open Folder"         "[$autoOpen]"
+        Show-MenuItem '17' "Filename Template"        "[$fnTpl]"
+        Show-MenuItem '18' "Browser Cookies"          "[$cookies]"
+        Show-MenuItem '19' "Proxy"                    "[$(if($proxy){$proxy}else{'none'})]"
+        Show-MenuItem '20' "SponsorBlock"             "[$(if($sbOn -eq 'true'){'On'}else{'Off'})]"
+        Show-MenuItem '21' "Disk Warning (GB)"        "[$diskWarn]"
         Write-Host ""
         Show-MenuItem '0'  "Back to Main Menu"
 
-        $choice = Read-UserChoice -Prompt "Select setting" -Max 17 -AllowZero
+        $choice = Read-UserChoice -Prompt "Select setting" -Max 21 -AllowZero
         if ($null -eq $choice) { continue }
 
         switch ($choice) {
             '0' { return }
             '1' {
                 $newVal = Read-UserInput -Prompt "Enter download folder path (relative or absolute)"
-                if ($newVal) { Set-Setting 'General' 'DownloadFolder' $newVal }
+                if ($newVal) {
+                    Set-Setting 'General' 'DownloadFolder' $newVal
+                    if (-not [System.IO.Path]::IsPathRooted($newVal)) {
+                        $Script:DownloadBaseDir = Join-Path $Script:ToolkitRoot $newVal
+                    } else {
+                        $Script:DownloadBaseDir = $newVal
+                    }
+                    $Script:DownloadDirs = @{
+                        Videos      = $Script:DownloadBaseDir
+                        Music       = $Script:DownloadBaseDir
+                        Playlists   = $Script:DownloadBaseDir
+                        Livestreams = $Script:DownloadBaseDir
+                        Shorts      = $Script:DownloadBaseDir
+                        Subtitles   = $Script:DownloadBaseDir
+                        Metadata    = $Script:DownloadBaseDir
+                    }
+                    if (-not (Test-Path $Script:DownloadBaseDir)) {
+                        New-Item -ItemType Directory -Path $Script:DownloadBaseDir -Force | Out-Null
+                    }
+                }
             }
             '2' {
-                Write-Host ""; Write-Host "   1. best"; Write-Host "   2. h264"; Write-Host "   3. h265"; Write-Host "   4. av1"; Write-Host "   5. vp9"
-                $c = Read-UserChoice -Prompt "Select codec" -Max 5
-                $codecs = @{ '1'='best'; '2'='h264'; '3'='h265'; '4'='av1'; '5'='vp9' }
+                Write-Host ""
+                Write-Host "   1. best (Highest available)"
+                Write-Host "   2. premiere-prores (Apple ProRes 422 HQ - Lossless for Premiere Pro)"
+                Write-Host "   3. premiere-lossless (Lossless H.264 CRF 0 - Premiere Pro)"
+                Write-Host "   4. h264 (Standard compatible MP4)"
+                Write-Host "   5. h265 / HEVC"
+                Write-Host "   6. av1"
+                Write-Host "   7. vp9"
+                $c = Read-UserChoice -Prompt "Select codec" -Max 7
+                $codecs = @{
+                    '1'='best'; '2'='premiere-prores'; '3'='premiere-lossless';
+                    '4'='h264'; '5'='h265'; '6'='av1'; '7'='vp9'
+                }
                 if ($c -and $codecs.ContainsKey($c)) { Set-Setting 'Video' 'PreferredCodec' $codecs[$c] }
             }
             '3' {
@@ -2736,6 +3431,21 @@ function Show-SettingsMenu {
                 if ($c -and $qualities.ContainsKey($c)) { Set-Setting 'Audio' 'PreferredQuality' $qualities[$c] }
             }
             '6' {
+                $newVal = Read-UserInput -Prompt "Enter number of concurrent download fragments/threads (1-16)"
+                if ($newVal -match '^\d+$' -and [int]$newVal -ge 1 -and [int]$newVal -le 16) {
+                    Set-Setting 'General' 'ConcurrentFragments' $newVal
+                } else { Write-Color "  Invalid value. Must be between 1 and 16." $Script:Colors.Warning; Wait-User }
+            }
+            '7' {
+                $newVal = Read-UserInput -Prompt "Enter download speed limit (e.g. 5M, 500K, or 0 for unlimited)"
+                if ($newVal) { Set-Setting 'General' 'SpeedLimit' $newVal }
+            }
+            '8' { Set-Setting 'Video' 'EmbedSubtitles' $(if ($embSub -eq 'true') {'false'} else {'true'}) }
+            '9' { Set-Setting 'Video' 'EmbedChapters'  $(if ($embCh -eq 'true') {'false'} else {'true'}) }
+            '10' { Set-Setting 'Downloads' 'EmbedMetadata' $(if ($embedMd -eq 'true') {'false'} else {'true'}) }
+            '11' { Set-Setting 'Downloads' 'EmbedThumbnails' $(if ($embedTh -eq 'true') {'false'} else {'true'}) }
+            '12' { Set-Setting 'Downloads' 'ArchiveMode' $(if ($archive -eq 'true') {'false'} else {'true'}) }
+            '13' {
                 Write-Host ""
                 $themeNames = @($Script:Themes.Keys)
                 for ($i = 0; $i -lt $themeNames.Count; $i++) {
@@ -2751,18 +3461,15 @@ function Show-SettingsMenu {
                     }
                 }
             }
-            '7' {
+            '14' {
                 $newVal = Read-UserInput -Prompt "Enter retry count (1-10)"
                 if ($newVal -match '^\d+$' -and [int]$newVal -ge 1 -and [int]$newVal -le 10) {
                     Set-Setting 'General' 'RetryCount' $newVal
                 } else { Write-Color "  Invalid value." $Script:Colors.Warning; Wait-User }
             }
-            '8'  { Set-Setting 'General' 'AutoUpdate' $(if ($autoUp -eq 'true') {'false'} else {'true'}) }
-            '9'  { Set-Setting 'General' 'AutoOpenFolder' $(if ($autoOpen -eq 'true') {'false'} else {'true'}) }
-            '10' { Set-Setting 'Downloads' 'EmbedMetadata' $(if ($embedMd -eq 'true') {'false'} else {'true'}) }
-            '11' { Set-Setting 'Downloads' 'EmbedThumbnails' $(if ($embedTh -eq 'true') {'false'} else {'true'}) }
-            '12' { Set-Setting 'Downloads' 'ArchiveMode' $(if ($archive -eq 'true') {'false'} else {'true'}) }
-            '13' {
+            '15' { Set-Setting 'General' 'AutoUpdate' $(if ($autoUp -eq 'true') {'false'} else {'true'}) }
+            '16' { Set-Setting 'General' 'AutoOpenFolder' $(if ($autoOpen -eq 'true') {'false'} else {'true'}) }
+            '17' {
                 Write-Host ""
                 Write-Color "  Filename templates use yt-dlp variables:" $Script:Colors.Info
                 Write-Host "   1. %(title)s.%(ext)s                    (Title only)"
@@ -2780,19 +3487,19 @@ function Show-SettingsMenu {
                     }
                 }
             }
-            '14' {
+            '18' {
                 Write-Host ""; Write-Host "   1. none"; Write-Host "   2. chrome"; Write-Host "   3. firefox"; Write-Host "   4. edge"; Write-Host "   5. opera"; Write-Host "   6. brave"
                 $c = Read-UserChoice -Prompt "Select browser" -Max 6
                 $browsers = @{ '1'='none'; '2'='chrome'; '3'='firefox'; '4'='edge'; '5'='opera'; '6'='brave' }
                 if ($c -and $browsers.ContainsKey($c)) { Set-Setting 'Network' 'CookieBrowser' $browsers[$c] }
             }
-            '15' {
+            '19' {
                 $newVal = Read-UserInput -Prompt "Enter proxy URL (e.g., socks5://127.0.0.1:1080) or 'none'"
                 if ($newVal -eq 'none') { Set-Setting 'Network' 'Proxy' '' }
                 elseif ($newVal) { Set-Setting 'Network' 'Proxy' $newVal }
             }
-            '16' { Set-Setting 'SponsorBlock' 'Enabled' $(if ($sbOn -eq 'true') {'false'} else {'true'}) }
-            '17' {
+            '20' { Set-Setting 'SponsorBlock' 'Enabled' $(if ($sbOn -eq 'true') {'false'} else {'true'}) }
+            '21' {
                 $newVal = Read-UserInput -Prompt "Enter warning threshold in GB (e.g., 2)"
                 if ($newVal -match '^\d+\.?\d*$' -and [double]$newVal -gt 0) {
                     Set-Setting 'General' 'DiskWarningThresholdGB' $newVal
@@ -2865,14 +3572,10 @@ function Show-MaintenanceMenu {
                     Write-Status "Configuration: Not found" -Type Warning
                 }
 
-                $missingDirs = 0
-                foreach ($dir in $Script:DownloadDirs.Values) {
-                    if (-not (Test-Path $dir)) { $missingDirs++ }
-                }
-                if ($missingDirs -eq 0) {
-                    Write-Status "Download folders: All present ($($Script:DownloadDirs.Count) dirs)" -Type Success
+                if (Test-Path $Script:DownloadBaseDir) {
+                    Write-Status "Download folder: Present ($Script:DownloadBaseDir)" -Type Success
                 } else {
-                    Write-Status "Download folders: $missingDirs missing" -Type Warning
+                    Write-Status "Download folder: Missing" -Type Warning
                 }
 
                 if (Test-Path $Script:ArchiveFile) {
@@ -3106,26 +3809,28 @@ function Show-MainMenu {
     Write-Color "  DOWNLOAD" $Script:Colors.Heading
     Show-MenuItem '1'  "Download Video"
     Show-MenuItem '2'  "Download Audio"
+    Show-MenuItem '3'  "Download Clip / Time Range"
+    Show-MenuItem '4'  "Search YouTube & Download"
     Write-Host ""
 
     Write-Color "  ADVANCED" $Script:Colors.Heading
-    Show-MenuItem '3'  "Playlist Download"
-    Show-MenuItem '4'  "Livestream Download"
-    Show-MenuItem '5'  "Batch Downloads"
-    Show-MenuItem '6'  "Download Thumbnail"
-    Show-MenuItem '7'  "Download Subtitles"
-    Show-MenuItem '8'  "Download Metadata"
-    Show-MenuItem '9'  "SponsorBlock Download"
+    Show-MenuItem '5'  "Playlist Download"
+    Show-MenuItem '6'  "Livestream Download"
+    Show-MenuItem '7'  "Batch Downloads (List or URLs File)"
+    Show-MenuItem '8'  "Download Thumbnail"
+    Show-MenuItem '9'  "Download Subtitles"
+    Show-MenuItem '10' "Download Metadata"
+    Show-MenuItem '11' "SponsorBlock Download"
     Write-Host ""
 
     Write-Color "  TOOLS" $Script:Colors.Heading
-    Show-MenuItem '10' "Convert Existing Files"
-    Show-MenuItem '11' "Open Download Folder"
-    Show-MenuItem '12' "History"
-    Show-MenuItem '13' "Settings"
-    Show-MenuItem '14' "Maintenance"
-    Show-MenuItem '15' "About"
-    Show-MenuItem '16' "Exit"
+    Show-MenuItem '12' "Convert Existing Files"
+    Show-MenuItem '13' "Open Download Folder"
+    Show-MenuItem '14' "History"
+    Show-MenuItem '15' "Settings"
+    Show-MenuItem '16' "Maintenance"
+    Show-MenuItem '17' "About"
+    Show-MenuItem '18' "Exit"
 }
 
 function Invoke-MainMenuAction {
@@ -3134,15 +3839,17 @@ function Invoke-MainMenuAction {
     switch ($Choice) {
         '1'  { Start-VideoDownload }
         '2'  { Start-AudioDownload }
-        '3'  { Start-PlaylistDownload }
-        '4'  { Start-LivestreamDownload }
-        '5'  { Start-BatchDownload }
-        '6'  { Start-ThumbnailDownload }
-        '7'  { Start-SubtitleDownload }
-        '8'  { Start-MetadataDownload }
-        '9'  { Start-SponsorBlockDownload }
-        '10' { Start-FileConversion }
-        '11' {
+        '3'  { Start-ClipDownload }
+        '4'  { Start-YouTubeSearch }
+        '5'  { Start-PlaylistDownload }
+        '6'  { Start-LivestreamDownload }
+        '7'  { Start-BatchDownload }
+        '8'  { Start-ThumbnailDownload }
+        '9'  { Start-SubtitleDownload }
+        '10' { Start-MetadataDownload }
+        '11' { Start-SponsorBlockDownload }
+        '12' { Start-FileConversion }
+        '13' {
             $downloadFolder = Get-Setting 'General' 'DownloadFolder'
             if (-not [System.IO.Path]::IsPathRooted($downloadFolder)) {
                 $downloadFolder = Join-Path $Script:ToolkitRoot $downloadFolder
@@ -3154,11 +3861,11 @@ function Invoke-MainMenuAction {
                 Wait-User
             }
         }
-        '12' { Show-History }
-        '13' { Show-SettingsMenu }
-        '14' { Show-MaintenanceMenu }
-        '15' { Show-About }
-        '16' { return 'exit' }
+        '14' { Show-History }
+        '15' { Show-SettingsMenu }
+        '16' { Show-MaintenanceMenu }
+        '17' { Show-About }
+        '18' { return 'exit' }
         default {
             Write-Color "  Invalid option. Please try again." $Script:Colors.Warning
             Start-Sleep -Milliseconds 800
@@ -3183,7 +3890,7 @@ try {
         Clear-Screen
         Show-MainMenu
 
-        $choice = Read-UserChoice -Prompt "Select option" -Max 16
+        $choice = Read-UserChoice -Prompt "Select option" -Max 18
         if ($null -eq $choice) { continue }
 
         $result = Invoke-MainMenuAction -Choice $choice

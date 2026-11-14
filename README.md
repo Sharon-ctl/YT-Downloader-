@@ -1,68 +1,72 @@
 # YTDL Toolkit
 
-**YTDL Toolkit** is a powerful, zero-knowledge-required Windows application for downloading video, audio, playlists, livestreams, subtitles, and metadata from thousands of supported websites. Powered by `yt-dlp` and `FFmpeg`, it wraps the complexity of command-line media tools into a beautiful, intuitive, wizard-style interactive menu.
+**YTDL Toolkit** is a powerful, zero-knowledge-required Windows application for downloading video, audio, playlists, livestreams, clips, subtitles, and metadata from YouTube and thousands of supported websites. Powered by `yt-dlp` and `FFmpeg`, it wraps the complexity of command-line media tools into a beautiful, intuitive, wizard-style interactive menu.
 
 ---
 
 ## Features
 
-*   **Wizard-Style Interface:** No complex command-line arguments to memorize. Just paste a URL and choose your desired format from simple menus.
+*   **Wizard-Style Interface:** No complex command-line arguments to memorize. Simple numbers-based menus guide you through every choice.
+*   **Automatic Clipboard Detection:** When prompted for a URL, copied links are detected automatically — simply press `Enter` to download!
+*   **Built-in YouTube Search:** Search YouTube directly from inside the terminal and download without ever opening your web browser.
+*   **Time-Range & Clip Downloader:** Download exact video or audio segments by specifying start and end timestamps (e.g. `01:30` to `02:45`).
+*   **Accelerated Multi-Threaded Downloads:** Downloads multiple video/audio fragments in parallel (up to 16 concurrent threads) for blazing-fast download speeds.
 *   **Massive Format Support:** Download everything from MP3s and lossless FLAC audio to lightweight H.264 clips and ultra-high-quality 4K AV1 videos.
-*   **Fully Automatic Setup:** Simply run the launcher. The toolkit automatically downloads, installs, and manages the correct versions of `yt-dlp` and `FFmpeg` for you.
-*   **Intelligent File Handling:** Downloads are safely processed in local Windows temporary folders before being moved to your final directory. This makes the toolkit **100% compatible with OneDrive and Google Drive syncing folders** without causing file lock crashes.
-*   **Advanced Capabilities:** 
-    *   Download massive playlists
-    *   Record active livestreams
-    *   Download in bulk via Batch mode
-    *   Extract thumbnails and subtitles
-    *   Use SponsorBlock to automatically remove intro/outro/sponsor segments
-*   **Built-in Maintenance:** Integrated tools for checking dependencies, repairing configurations, clearing caches, and reading session logs.
+*   **SponsorBlock Integration:** Automatically detect and remove sponsor segments, intros, outros, and self-promotion from downloaded videos.
+*   **Embedded Subtitles & Chapters:** Embed multilingual subtitles and chapter markers directly into your output MP4/MKV video files.
+*   **Batch & Playlist Modes:** Queue multiple URLs manually or load an entire text file (`urls.txt`). Download complete playlists in normal or reverse chronological order.
+*   **Intelligent File Handling & Archive:** Downloads are processed in temporary folders before final placement (**100% OneDrive & Google Drive friendly**). Automatically remembers downloaded items to avoid duplicate downloads, with smart re-download prompts if files were deleted.
+*   **Adobe Premiere Pro Lossless Workflow:** Download directly or convert existing files to **Apple ProRes 422 HQ (.mov)** (10-bit intra-frame, uncompressed PCM 48kHz audio, zero scrub lag) or **Lossless H.264 (.mp4)** (CRF 0, YUV420p) for immediate, stutter-free timeline editing.
+*   **File Converter:** Convert any existing local media files between Apple ProRes (.mov), Lossless H.264, Fast Remux, Avid DNxHD/HR, MP4, MKV, AVI, WAV (24-bit 48kHz), MP3, FLAC, and M4A with live conversion progress.
+*   **Fully Automatic Setup:** On first launch, the toolkit automatically checks, installs, and manages the correct versions of `yt-dlp` and `FFmpeg`.
 
 ---
 
 ## Installation & Getting Started
 
-1. **Download the Toolkit:** Download the toolkit folder and place it anywhere on your PC (Desktop, Documents, etc.).
-2. **Launch the Application:** Double-click the `Launcher.bat` file.
-    *   *Note: Ensure you are connected to the internet on first launch. The toolkit will automatically download its required background dependencies (`yt-dlp` and `FFmpeg`).*
-3. **Start Downloading:** From the main menu, press `1` to download a video or `2` to download audio. Follow the on-screen prompts!
+1. **Download or Clone the Toolkit:** Place the folder anywhere on your PC (`Documents`, `Desktop`, etc.).
+2. **Launch the Application:** Double-click `Launcher.bat`.
+    *   *Note: Ensure you are connected to the internet on first launch so the toolkit can automatically fetch `yt-dlp` and `FFmpeg`.*
+3. **Start Downloading:** Select an option from the menu:
+    *   `1` — Download Video (with preferred/custom quality)
+    *   `2` — Download Audio (MP3, FLAC, WAV, M4A, OPUS)
+    *   `3` — Download a specific Clip / Time Range
+    *   `4` — Search YouTube and download results
+    *   `5` — Download Playlists (full, range, or reverse)
+    *   `7` — Batch download from console or text file
 
 ---
 
 ## Configuration & Settings
 
-You can customize the toolkit's behavior by selecting **Settings (Option 13)** from the main menu. 
+Open **Settings (Option 15)** from the main menu to customize:
 
-Key settings include:
-*   **Download Folder:** Change where your downloaded files are saved. By default, they are sorted into organized folders (Videos, Music, Playlists, etc.) inside the toolkit directory.
-*   **Preferred Codecs & Formats:** Set your favorite video/audio formats to streamline the download process.
-*   **Themes:** Change the terminal colors to match your style.
-*   **Browser Cookies:** Easily link the toolkit to your web browser (Chrome, Edge, Firefox, etc.) to securely bypass age restrictions or bot-detection screens!
+*   **Download Folder:** Set custom folders for videos, music, playlists, and metadata.
+*   **Preferred Codecs & Formats:** Set default quality (e.g., `1080p`, `h264`, `mp3`, `320k`) to download with a single press.
+*   **Concurrent Threads:** Configure parallel download fragments (default `4`, up to `16`).
+*   **Speed Limit:** Limit bandwidth usage (e.g. `5M`, `500K`) or set `0` for unlimited.
+*   **Embed Subtitles & Chapters:** Toggle automatic subtitle and chapter embedding into video files.
+*   **Themes:** Choose from 5 console color themes (`Classic`, `Blue`, `Green`, `Purple`, `White`).
+*   **Browser Cookies:** Link your browser (`chrome`, `edge`, `firefox`, `brave`) to download age-restricted or members-only videos.
 
 ---
 
 ## Troubleshooting
 
-If a download fails or behaves unexpectedly, try these built-in fixes:
+### "Sign in to confirm you're not a bot" / Age Restrictions
+YouTube often blocks automated requests.
+**Fix:** Open **Settings -> Browser Cookies (Option 18)**. Select your primary browser (`chrome`, `edge`, `firefox`, `brave`). The toolkit will use your existing login session securely.
 
-### "Sign in to confirm you're not a bot" / "Sign in to confirm your age"
-YouTube aggressively blocks automated downloads. 
-**Fix:** Open the Toolkit, go to **Tools -> Settings -> Browser Cookies** (Option 14). Type the name of the browser you use for YouTube (e.g., `chrome`, `edge`, `firefox`, `brave`). The toolkit will use your browser's login session to authenticate you securely.
-
-### File Lock Errors / Write Permission Errors
-Ensure that your toolkit folder is fully extracted from its ZIP file. If you are experiencing permission errors, try moving the folder to your `Desktop` or `Documents`.
+### File Lock Errors / Write Permissions
+Ensure your folder is unzipped and not in a system-restricted directory like `C:\Windows\System32`. Use `Documents` or `Desktop`.
 
 ### Corrupted Dependencies
-If `yt-dlp` or `FFmpeg` becomes corrupted or outdated, go to **Maintenance** (Option 14 from the main menu) and select the option to reinstall them.
-
-### View Detailed Logs
-If something goes wrong, the toolkit records every action. Go to **Maintenance -> View Logs** (Option 11) to read the exact error outputs for debugging.
+If yt-dlp or FFmpeg encounters issues, go to **Maintenance (Option 16)** and select **Reinstall yt-dlp** or **Reinstall FFmpeg**.
 
 ---
 
 ## License & Credits
 
-This project is open-source under the MIT License.
-
-*   **yt-dlp:** Powered by the incredible [yt-dlp project](https://github.com/yt-dlp/yt-dlp).
-*   **FFmpeg:** Media processing powered by [FFmpeg](https://ffmpeg.org/). Windows essentials builds provided by [gyan.dev](https://www.gyan.dev/).
+Released under the MIT License.
+*   [yt-dlp](https://github.com/yt-dlp/yt-dlp)
+*   [FFmpeg](https://ffmpeg.org/) (Windows builds courtesy of [gyan.dev](https://www.gyan.dev/))

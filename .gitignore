@@ -1,0 +1,27 @@
+# Dependencies downloaded at runtime
+tools/
+ffmpeg/
+yt-dlp.exe
+
+# Downloads and user media
+downloads/
+
+# Logs, cache, and temporary files
+logs/
+cache/
+temp/
+*.log
+diagnostics_*.zip
+.write_test
+
+# Local user history & archives
+archive.txt
+history.txt
+
+# Local configuration
+config/config.ini
+
+# OS artifacts
+Thumbs.db
+Desktop.ini
+.DS_Store
