@@ -32,7 +32,8 @@ $Script:YtDlpPath        = Join-Path $Script:ToolsDir 'yt-dlp.exe'
 $Script:FFmpegDir        = Join-Path $Script:ToolsDir 'ffmpeg'
 $Script:FFmpegPath       = Join-Path $Script:FFmpegDir 'ffmpeg.exe'
 $Script:FFprobePath      = Join-Path $Script:FFmpegDir 'ffprobe.exe'
-$Script:ConfigFile       = Join-Path $Script:ConfigDir 'config.ini'
+$Script:DenoPath         = Join-Path $Script:ToolsDir 'deno.exe'
+$Script:ConfigFile      = Join-Path $Script:ConfigDir 'config.ini'
 $Script:ArchiveFile      = Join-Path $Script:ToolkitRoot 'archive.txt'
 $Script:HistoryFile      = Join-Path $Script:ToolkitRoot 'history.txt'
 $Script:LogFile          = $null
@@ -56,8 +57,12 @@ $Script:DownloadDirs = @{
 $Script:YtDlpDownloadUrl = 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe'
 $Script:YtDlpApiUrl      = 'https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest'
 
-# FFmpeg download URL (gyan.dev)
-$Script:FFmpegDownloadUrl = 'https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip'
+# FFmpeg download URLs (gyan.dev first, BtbN on GitHub as a fallback)
+$Script:FFmpegDownloadUrl         = 'https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip'
+$Script:FFmpegFallbackDownloadUrl = 'https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip'
+
+# Deno download URL. yt-dlp needs a JavaScript runtime to download from YouTube.
+$Script:DenoDownloadUrl = 'https://github.com/denoland/deno/releases/latest/download/deno-x86_64-pc-windows-msvc.zip'
 
 # SponsorBlock category mapping
 $Script:SponsorBlockCategories = [ordered]@{
@@ -79,6 +84,12 @@ $Script:VideoCodecs = @('best', 'premiere-prores', 'premiere-lossless', 'h264', 
 # Console encoding
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $OutputEncoding = [System.Text.Encoding]::UTF8
+
+# GitHub and most download hosts require TLS 1.2; older Windows PowerShell
+# defaults can fail with "the underlying connection was closed".
+try {
+    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+} catch { }
 
 #endregion
 
@@ -806,31 +817,66 @@ function Test-WindowsVersion {
     return $true
 }
 
-function Test-Internet {
-    Write-Status "Checking internet connection..." -Type Working
+# Returns $true if the server answers over HTTPS at all (any HTTP status counts).
+# This follows the system proxy, unlike a raw TCP probe.
+function Test-HttpReachable {
+    param([string]$Url, [int]$TimeoutMs = 5000)
+    try {
+        $req = [System.Net.HttpWebRequest]::Create($Url)
+        $req.Method = 'HEAD'
+        $req.Timeout = $TimeoutMs
+        $req.AllowAutoRedirect = $true
+        $req.UserAgent = 'YTDL-Toolkit'
+        $resp = $req.GetResponse()
+        $resp.Close()
+        return $true
+    } catch [System.Net.WebException] {
+        # An error response such as 403 or 405 still proves the server is reachable.
+        return ($null -ne $_.Exception.Response)
+    } catch {
+        return $false
+    }
+}
+
+function Test-TcpReachable {
+    param([string]$HostName, [int]$Port, [int]$TimeoutMs = 3000)
+    $tcp = $null
     try {
         $tcp = New-Object System.Net.Sockets.TcpClient
-        $connectResult = $tcp.BeginConnect('8.8.8.8', 53, $null, $null)
-        $success = $connectResult.AsyncWaitHandle.WaitOne(3000)
-        $tcp.Close()
-        if ($success) {
-            Write-Status "Internet connected" -Type Success
-            $Script:IsOffline = $false
-            return $true
-        }
-    } catch { }
+        $connectResult = $tcp.BeginConnect($HostName, $Port, $null, $null)
+        # The wait handle is also signaled when the connection is refused, so
+        # finish the connect and confirm it actually succeeded.
+        if (-not $connectResult.AsyncWaitHandle.WaitOne($TimeoutMs)) { return $false }
+        $tcp.EndConnect($connectResult)
+        return $tcp.Connected
+    } catch {
+        return $false
+    } finally {
+        if ($tcp) { try { $tcp.Close() } catch { } }
+    }
+}
 
-    try {
-        $tcp2 = New-Object System.Net.Sockets.TcpClient
-        $connectResult2 = $tcp2.BeginConnect('1.1.1.1', 53, $null, $null)
-        $success2 = $connectResult2.AsyncWaitHandle.WaitOne(3000)
-        $tcp2.Close()
-        if ($success2) {
-            Write-Status "Internet connected" -Type Success
-            $Script:IsOffline = $false
-            return $true
+function Test-Internet {
+    Write-Status "Checking internet connection..." -Type Working
+
+    # Probe the sites this toolkit actually needs, over HTTPS. Many networks block
+    # raw DNS traffic to 8.8.8.8 or 1.1.1.1 even though browsing works, so a DNS
+    # port check alone wrongly reported "offline" and blocked every download.
+    $online = $false
+    foreach ($probe in @('https://github.com', 'https://www.youtube.com', 'https://www.google.com/generate_204')) {
+        if (Test-HttpReachable $probe) { $online = $true; break }
+    }
+    if (-not $online) {
+        foreach ($probe in @(@('8.8.8.8', 53), @('1.1.1.1', 53))) {
+            if (Test-TcpReachable $probe[0] $probe[1]) { $online = $true; break }
         }
-    } catch { }
+    }
+
+    if ($online) {
+        Write-Status "Internet connected" -Type Success
+        $Script:IsOffline = $false
+        return $true
+    }
 
     Write-Status "No internet connection detected" -Type Warning
     $Script:IsOffline = $true
@@ -989,6 +1035,8 @@ function Invoke-StartupSequence {
     if (-not $Script:IsOffline) {
         $ytdlpOk  = Test-YtDlp
         $ffmpegOk = Test-FFmpeg
+        # Deno is needed for YouTube, but a failure should not block the toolkit.
+        [void](Test-Deno)
 
         while (-not $ytdlpOk -or -not $ffmpegOk) {
             Write-Host ""
@@ -1177,7 +1225,7 @@ function Invoke-FileDownloadWithProgress {
 function Install-YtDlp {
     Write-Status "Downloading yt-dlp..." -Type Working
     try {
-        Invoke-FileDownloadWithProgress -Url $Script:YtDlpDownloadUrl -OutFile $Script:YtDlpPath -Title "yt-dlp.exe"
+        [void](Invoke-FileDownloadWithProgress -Url $Script:YtDlpDownloadUrl -OutFile $Script:YtDlpPath -Title "yt-dlp.exe")
         if (Test-Path $Script:YtDlpPath) {
             $ver = Get-YtDlpVersion
             Write-Status "yt-dlp $ver installed successfully" -Type Success
@@ -1241,11 +1289,12 @@ function Test-FFmpeg {
     return $true
 }
 
-function Install-FFmpeg {
-    Write-Status "Downloading FFmpeg Essentials..." -Type Working
+function Install-FFmpegFromUrl {
+    param([string]$DownloadUrl, [string]$DisplayName)
+    Write-Status "Downloading $DisplayName..." -Type Working
     $zipPath = Join-Path $Script:TempDir 'ffmpeg.zip'
     try {
-        Invoke-FileDownloadWithProgress -Url $Script:FFmpegDownloadUrl -OutFile $zipPath -Title "FFmpeg Essentials"
+        [void](Invoke-FileDownloadWithProgress -Url $DownloadUrl -OutFile $zipPath -Title $DisplayName)
 
         Write-Status "Extracting FFmpeg..." -Type Working
         $extractDir = Join-Path $Script:TempDir 'ffmpeg_extract'
@@ -1275,14 +1324,93 @@ function Install-FFmpeg {
         if ((Test-Path $Script:FFmpegPath) -and (Test-Path $Script:FFprobePath)) {
             $ver = Get-FFmpegVersion
             Write-Status "FFmpeg $ver installed successfully" -Type Success
+            return $true
         } else {
             Write-Status "FFmpeg extraction failed -- some files were not found" -Type Error
+            return $false
         }
     } catch {
         Write-Status "Failed to install FFmpeg: $($_.Exception.Message)" -Type Error
-        Write-Log 'ERROR' "FFmpeg install failed: $($_.Exception.Message)"
+        Write-Log 'ERROR' "FFmpeg install failed ($DisplayName): $($_.Exception.Message)"
         Remove-Item $zipPath -Force -ErrorAction SilentlyContinue
+        return $false
     }
+}
+
+function Install-FFmpeg {
+    if (Install-FFmpegFromUrl -DownloadUrl $Script:FFmpegDownloadUrl -DisplayName 'FFmpeg Essentials') { return }
+    Write-Status "Trying the backup FFmpeg source..." -Type Warning
+    [void](Install-FFmpegFromUrl -DownloadUrl $Script:FFmpegFallbackDownloadUrl -DisplayName 'FFmpeg (backup source)')
+}
+
+# ---- Deno (JavaScript runtime) ------------------------------------------------
+# yt-dlp needs an external JavaScript runtime to download from YouTube. Without
+# one, YouTube extraction fails or returns no usable formats.
+
+function Get-DenoVersion {
+    if (-not (Test-Path $Script:DenoPath)) { return 'Not installed' }
+    try {
+        $out = & $Script:DenoPath --version 2>&1 | Select-Object -First 1
+        $outStr = ($out | Out-String).Trim()
+        if ($outStr -match 'deno\s+(\S+)') { return $Matches[1] }
+        return $outStr
+    } catch {
+        return 'Unknown'
+    }
+}
+
+function Install-Deno {
+    Write-Status "Downloading Deno (JavaScript runtime for YouTube)..." -Type Working
+    $zipPath    = Join-Path $Script:TempDir 'deno.zip'
+    $extractDir = Join-Path $Script:TempDir 'deno_extract'
+    try {
+        [void](Invoke-FileDownloadWithProgress -Url $Script:DenoDownloadUrl -OutFile $zipPath -Title 'Deno')
+
+        if (Test-Path $extractDir) { Remove-Item $extractDir -Recurse -Force }
+        Expand-Archive -Path $zipPath -DestinationPath $extractDir -Force
+
+        $denoExe = Get-ChildItem -Path $extractDir -Recurse -File -Filter 'deno.exe' | Select-Object -First 1
+        if ($denoExe) {
+            Copy-Item $denoExe.FullName -Destination $Script:DenoPath -Force
+        }
+    } catch {
+        Write-Status "Failed to install Deno: $($_.Exception.Message)" -Type Error
+        Write-Log 'ERROR' "Deno install failed: $($_.Exception.Message)"
+    } finally {
+        Remove-Item $zipPath -Force -ErrorAction SilentlyContinue
+        Remove-Item $extractDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    if (Test-Path $Script:DenoPath) {
+        Write-Status "Deno $(Get-DenoVersion) installed successfully" -Type Success
+    } else {
+        Write-Status "Deno could not be installed -- YouTube downloads may fail" -Type Warning
+    }
+}
+
+function Test-Deno {
+    Write-Status "Checking Deno (JavaScript runtime)..." -Type Working
+    if (-not (Test-Path $Script:DenoPath)) {
+        Write-Status "Deno not found -- installing..." -Type Warning
+        Install-Deno
+        return (Test-Path $Script:DenoPath)
+    }
+    $ver = Get-DenoVersion
+    if ($ver -eq 'Unknown' -or [string]::IsNullOrEmpty($ver)) {
+        Write-Status "Deno appears corrupted -- reinstalling..." -Type Warning
+        Install-Deno
+        return (Test-Path $Script:DenoPath)
+    }
+    Write-Status "Deno $ver" -Type Success
+    return $true
+}
+
+# Arguments that tell yt-dlp where to find the JavaScript runtime.
+function Get-JsRuntimeArgs {
+    if (Test-Path $Script:DenoPath) {
+        return @('--js-runtimes', "deno:$Script:DenoPath")
+    }
+    return @()
 }
 
 #endregion
@@ -1307,7 +1435,12 @@ function Get-MediaInfo {
     param([string]$Url)
     if (-not (Test-Path $Script:YtDlpPath)) { return $null }
 
-    $argsList = @('--dump-json', '--no-download', '--no-warnings', '--no-playlist')
+    # Print only the fields the toolkit uses. The full --dump-json output can be
+    # several MB for YouTube (every caption language and format), which Windows
+    # PowerShell 5.1's ConvertFrom-Json can fail to parse, blocking the download.
+    $infoFields = 'title,uploader,duration,view_count,width,height,resolution,vcodec,acodec,filesize_approx,filesize,webpage_url_domain,extractor,is_live,live_status,was_live,playlist_count,thumbnail'
+    $argsList = @('--print', "%(.{$infoFields})j", '--no-download', '--no-warnings', '--no-playlist')
+    $argsList += @(Get-JsRuntimeArgs)
     $cookieBrowser = Get-Setting 'Network' 'CookieBrowser'
     if ($cookieBrowser -and $cookieBrowser -ne 'none') {
         $argsList += @('--cookies-from-browser', $cookieBrowser)
@@ -1454,6 +1587,12 @@ function Invoke-PreFlightChecks {
     )
 
     if ($Script:IsOffline) {
+        # The startup check may have been wrong, or the connection may be back.
+        foreach ($probe in @('https://github.com', 'https://www.youtube.com')) {
+            if (Test-HttpReachable $probe) { $Script:IsOffline = $false; break }
+        }
+    }
+    if ($Script:IsOffline) {
         Show-Error -CustomMessage "You are offline. Downloads require an internet connection."
         return $null
     }
@@ -1592,6 +1731,8 @@ function Get-CommonArgs {
     [void]$argsList.Add('--ffmpeg-location')
     [void]$argsList.Add($Script:FFmpegDir)
 
+    foreach ($jsArg in @(Get-JsRuntimeArgs)) { [void]$argsList.Add($jsArg) }
+
     [void]$argsList.Add('--newline')
     [void]$argsList.Add('--no-colors')
     [void]$argsList.Add('--progress')
@@ -1654,6 +1795,34 @@ function Get-CommonArgs {
     return ,$argsList
 }
 
+# Quotes one argument for a Windows command line (CommandLineToArgvW rules).
+# Plain wrapping in quotes breaks on a trailing backslash, e.g. "D:\My Videos\"
+# swallows the closing quote and corrupts every argument after it.
+function ConvertTo-ProcessArgument {
+    param([string]$Argument)
+    if ($null -eq $Argument -or $Argument.Length -eq 0) { return '""' }
+    if ($Argument -notmatch '[\s"]') { return $Argument }
+
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.Append('"')
+    $backslashes = 0
+    foreach ($ch in $Argument.ToCharArray()) {
+        if ($ch -eq [char]'\') {
+            $backslashes++
+        } elseif ($ch -eq [char]'"') {
+            [void]$sb.Append('\' * ($backslashes * 2 + 1))
+            [void]$sb.Append('"')
+            $backslashes = 0
+        } else {
+            if ($backslashes -gt 0) { [void]$sb.Append('\' * $backslashes); $backslashes = 0 }
+            [void]$sb.Append($ch)
+        }
+    }
+    if ($backslashes -gt 0) { [void]$sb.Append('\' * ($backslashes * 2)) }
+    [void]$sb.Append('"')
+    return $sb.ToString()
+}
+
 function Invoke-YtDlp {
     param(
         [string[]]$Arguments,
@@ -1668,9 +1837,7 @@ function Invoke-YtDlp {
     $allArgs = [System.Collections.ArrayList]@($Arguments)
     [void]$allArgs.Add($Url)
 
-    $argString = ($allArgs | ForEach-Object {
-        if ($_ -match '\s') { "`"$_`"" } else { $_ }
-    }) -join ' '
+    $argString = ($allArgs | ForEach-Object { ConvertTo-ProcessArgument ([string]$_) }) -join ' '
 
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = $Script:YtDlpPath

@@ -57,6 +57,12 @@ Open **Settings (Option 15)** from the main menu to customize:
 YouTube often blocks automated requests.
 **Fix:** Open **Settings -> Browser Cookies (Option 18)**. Select your primary browser (`chrome`, `edge`, `firefox`, `brave`). The toolkit will use your existing login session securely.
 
+### YouTube downloads fail or "Requested format is not available"
+yt-dlp needs a JavaScript runtime to download from YouTube. The toolkit installs **Deno** automatically into the `tools` folder on startup and passes it to yt-dlp. If YouTube downloads still fail, delete `tools\deno.exe` and restart the toolkit to reinstall it, then check **Maintenance (Option 16)** to update yt-dlp.
+
+### "No internet connection detected" but your internet works
+The startup check tries to open HTTPS connections to GitHub, YouTube and Google (so it follows your system proxy). If you chose "continue offline" by mistake, you do not need to restart: the toolkit rechecks the connection when you start a download.
+
 ### File Lock Errors / Write Permissions
 Ensure your folder is unzipped and not in a system-restricted directory like `C:\Windows\System32`. Use `Documents` or `Desktop`.
 
